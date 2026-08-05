@@ -1,5 +1,5 @@
 // ============================================================================
-// AGGIE'S NEW TELEPHONE — Voice Gateway (Twilio ConversationRelay <-> Anthropic)
+// AGGIE'S NEW TELEPHONE — Voice Gateway v1.1 (Twilio ConversationRelay <-> Anthropic)
 // Apex Pest Solutions · pairs with APS 2.0 v34.11 (hook=brainpack / hook=relay)
 //
 // WHY THIS EXISTS: Google Apps Script's front door degrades under daytime load
@@ -185,6 +185,27 @@ async function twilioUpdateCall(callSid, twiml) {
   });
   if (!r.ok) throw new Error('twilio update ' + r.status + ': ' + (await r.text()).slice(0, 200));
 }
+async function startRecording(s) {
+  // v1.1: mirror of the v23.5 law — every receptionist call is recorded. The
+  // recording callback rides to the SAME GAS hook (hook=rec) the old telephone
+  // used, so the Calls sheet row and playback land exactly like before.
+  if (s.recStarted || !s.callSid || !TW_SID) return;
+  s.recStarted = true;
+  try {
+    const cb = GAS_URL + '?hook=rec&k=' + encodeURIComponent(WKEY);
+    const u = 'https://api.twilio.com/2010-04-01/Accounts/' + TW_SID + '/Calls/' + s.callSid + '/Recordings.json';
+    const r = await fetch(u, {
+      method: 'POST',
+      headers: {
+        'authorization': 'Basic ' + Buffer.from(TW_SID + ':' + TW_TOKEN).toString('base64'),
+        'content-type': 'application/x-www-form-urlencoded'
+      },
+      body: 'RecordingStatusCallback=' + encodeURIComponent(cb) + '&RecordingStatusCallbackEvent=completed'
+    });
+    if (!r.ok) throw new Error('rec ' + r.status + ': ' + (await r.text()).slice(0, 140));
+    logInfo('recording started for ' + s.callSid);
+  } catch (e) { logErr('recording', e); }
+}
 const xesc = s => String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 
 // ---- results ramp: POST the finished call to GAS, with patient retries ------
@@ -215,7 +236,7 @@ function newSession(ws) {
     lead: {},                  // monotonic merge across turns — a fact once given is never lost
     flag: false, commercial: false, tierOffered: false, tierTaken: '',
     sched: null, done: false, finalized: false,
-    packPromise: null, pack: null,
+    packPromise: null, pack: null, callerPack: null, recStarted: false,
     ctl: null                  // AbortController of the in-flight AI turn
   };
 }
@@ -237,16 +258,28 @@ async function handlePrompt(s, voicePrompt) {
   if (s.ctl) { try { s.ctl.abort(); } catch (e) {} }
   s.convo.push({ role: 'user', content: String(voicePrompt).slice(0, 500) });
 
-  // brain: caller-specific if it arrived, generic otherwise — never wait long
-  if (!s.pack) {
-    try { s.pack = await Promise.race([ s.packPromise, new Promise(res => setTimeout(() => res(null), 1200)) ]); } catch (e) {}
-    if (!s.pack) s.pack = genericPack;
+  // v1.1 brain choice, EVERY turn: the caller-specific pack (their dossier
+  // inside) wins the moment it lands — even mid-call. First turn races it
+  // briefly, then falls to the generic brain rather than keep a human waiting.
+  if (!s.callerPack) {
+    try { await Promise.race([ s.packPromise, new Promise(res => setTimeout(res, 1200)) ]); } catch (e) {}
   }
-  if (!s.pack) {                       // cold boot AND GAS down — human net
-    sendText(s.ws, 'One moment while I connect you to the team.', true);
-    return doTransfer(s, 'no brain available');
+  let pack = s.callerPack || genericPack;
+  if (!pack) {
+    // v1.1 COLD-START PATIENCE: a fresh boot compiles the generic brain in the
+    // background. Say something human ONCE, then wait up to 8 more seconds
+    // before ever giving up. Transfer is the last resort, not the first reflex.
+    sendText(s.ws, 'One second while I pull that up for you.', true);
+    for (let i = 0; i < 16 && !genericPack && !s.callerPack; i++) {
+      await new Promise(res => setTimeout(res, 500));
+    }
+    pack = s.callerPack || genericPack;
+    if (!pack) {
+      sendText(s.ws, 'Let me get you straight to the team.', true);
+      return doTransfer(s, 'no brain after patience window');
+    }
   }
-  const sys = String(s.pack.sys).replace(/\{\{CALLER_ID\}\}/g, s.from || 'unknown');
+  const sys = String(pack.sys).replace(/\{\{CALLER_ID\}\}/g, s.from || 'unknown');
 
   const ctl = new AbortController();
   s.ctl = ctl;
@@ -358,7 +391,10 @@ wss.on('connection', ws => {
       callsHandled++;
       logInfo('call ' + s.callSid + ' from ' + s.from);
       // race the caller-specific brain (dossier inside) against the clock
-      s.packPromise = fetchPack(s.from, 6000).catch(e => { logErr('pack.caller', e); return null; });
+      s.packPromise = fetchPack(s.from, 25000)
+        .then(p => { if (p) { s.callerPack = p; logInfo('caller pack landed for ' + s.callSid); } return p; })
+        .catch(e => { logErr('pack.caller', e); return null; });
+      startRecording(s);   // v1.1: every live call is recorded, like v23.5 days
     }
     else if (m.type === 'prompt' && m.voicePrompt) {
       handlePrompt(s, m.voicePrompt).catch(e => logErr('handlePrompt', e));
