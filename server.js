@@ -1,5 +1,7 @@
 // ============================================================================
-// AGGIE'S NEW TELEPHONE — Voice Gateway v1.1 (Twilio ConversationRelay <-> Anthropic)
+// AGGIE'S NEW TELEPHONE — Voice Gateway v1.2 (Twilio ConversationRelay <-> Anthropic)
+// v1.2: outbound rescues ride this road too — customer number derived from
+// direction, call rows labeled correctly, and /health confesses its version.
 // Apex Pest Solutions · pairs with APS 2.0 v34.11 (hook=brainpack / hook=relay)
 //
 // WHY THIS EXISTS: Google Apps Script's front door degrades under daytime load
@@ -26,6 +28,7 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 
 // ---- config (all via environment; render.yaml wires these) -----------------
+const GW_VERSION = '1.2';
 const PORT       = process.env.PORT || 10000;
 const ANTHROPIC  = process.env.ANTHROPIC_API_KEY || '';
 const GAS_URL    = (process.env.GAS_EXEC_URL || '').replace(/\/+$/, ''); // full /exec URL, no query
@@ -231,7 +234,7 @@ let callsHandled = 0;
 
 function newSession(ws) {
   return {
-    ws, callSid: '', from: '', to: '', startedAt: Date.now(),
+    ws, callSid: '', from: '', to: '', dir: 'in', startedAt: Date.now(),
     convo: [],                 // [{role,content}] — assistant turns store REPLY TEXT, same as GAS
     lead: {},                  // monotonic merge across turns — a fact once given is never lost
     flag: false, commercial: false, tierOffered: false, tierTaken: '',
@@ -340,7 +343,7 @@ function finalize(s) {
   const secs = Math.max(1, Math.round((Date.now() - s.startedAt) / 1000));
   const hasLead = s.lead && (s.lead.name || s.lead.address || s.lead.pest);
   postResults({
-    sid: s.callSid, from: s.from, to: s.to, ts: new Date(s.startedAt).toISOString(),
+    sid: s.callSid, from: s.from, to: s.to, dir: s.dir, ts: new Date(s.startedAt).toISOString(),
     convo: s.convo.slice(-24),
     lead: hasLead ? s.lead : null,
     flag: s.flag, commercial: s.commercial,
@@ -356,7 +359,7 @@ const server = http.createServer((req, res) => {
   if (req.url && req.url.startsWith('/health')) {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({
-      ok: true, up: Math.round(process.uptime()),
+      ok: true, gateway: GW_VERSION, up: Math.round(process.uptime()),
       brainAgeSec: genericPack ? Math.round((Date.now() - genericAt) / 1000) : null,
       brainVersion: genericPack ? genericPack.v : null,
       model: MODEL, callsHandled, liveCalls: sessions.size,
@@ -386,8 +389,14 @@ wss.on('connection', ws => {
     try { m = JSON.parse(msg); } catch (e) { return; }
     if (m.type === 'setup') {
       s.callSid = String(m.callSid || '');
-      s.from = String(m.from || '');
-      s.to = String(m.to || '');
+      // v1.2: on an OUTBOUND rescue Twilio's from = our line and to = the
+      // customer. The dossier, the lead, and the Inbox thread all belong to
+      // the CUSTOMER — so s.from is always the customer's number, whichever
+      // direction the call travels, and s.dir remembers the truth for the row.
+      const outbound = /outbound/i.test(String(m.direction || ''));
+      s.dir = outbound ? 'out' : 'in';
+      s.from = String(outbound ? m.to : m.from) || '';
+      s.to = String(outbound ? m.from : m.to) || '';
       callsHandled++;
       logInfo('call ' + s.callSid + ' from ' + s.from);
       // race the caller-specific brain (dossier inside) against the clock
