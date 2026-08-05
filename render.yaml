@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: aggie-gateway
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /health
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: GAS_EXEC_URL
+        sync: false
+      - key: WEBHOOK_KEY
+        sync: false
+      - key: RELAY_TOKEN
+        generateValue: true
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: CHRIS_CELL
+        sync: false
+      - key: AGGIE_MODEL
+        value: claude-sonnet-4-6

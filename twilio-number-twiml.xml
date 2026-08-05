@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AGGIE'S NEW TELEPHONE — paste into a Twilio TwiML Bin named "aggie-relay"
+     and point the phone number's "A call comes in" at it.
+     THE SAFETY NET IS THE SHAPE: if the gateway is down, <Connect> fails and
+     the call falls straight through to <Dial> — Chris's cell, pre-Aggie days.
+     When Aggie finishes a call she hangs it up herself, so a booked caller
+     never falls through and rings Chris by accident. -->
+<Response>
+  <Connect>
+    <ConversationRelay
+      url="wss://YOUR-SERVICE.onrender.com/relay?t=PASTE_RELAY_TOKEN"
+      welcomeGreeting="Apex Pest Solutions, this is Aggie, I am Apex's Virtual Assistant. How can I help you today?"
+      interruptible="true" />
+  </Connect>
+  <Say>One moment while I try Chris for you.</Say>
+  <Dial timeout="25">PASTE_CHRIS_CELL</Dial>
+  <Say>Sorry we missed you. Please leave your name, number, and what you are seeing after the tone, and we will call you right back.</Say>
+  <Record maxLength="120" playBeep="true"/>
+  <Hangup/>
+</Response>

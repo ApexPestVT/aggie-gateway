@@ -1,0 +1,377 @@
+// ============================================================================
+// AGGIE'S NEW TELEPHONE — Voice Gateway (Twilio ConversationRelay <-> Anthropic)
+// Apex Pest Solutions · pairs with APS 2.0 v34.11 (hook=brainpack / hook=relay)
+//
+// WHY THIS EXISTS: Google Apps Script's front door degrades under daytime load
+// (verified: same code, 4 AM pass / 11 AM 502, GAS error log empty — the code
+// never ran). So the LIVE CALL leaves Google entirely. Twilio streams caller
+// speech here over a websocket; this service runs Aggie's brain against the
+// Anthropic API and streams her words straight back into the caller's ear.
+// GAS remains book of record and brain source — reached only OFF the call.
+//
+// DESIGN LAWS (carried over from APS): nothing fails silently (every error is
+// in the ring buffer at /health), one rulebook (the brain is compiled BY GAS,
+// pulled here — zero prompt drift), lossless pipeline (results POST retries,
+// and the 30-min Twilio reconciliation sweep in GAS is the final backstop).
+//
+// FAILURE MODE BY CONSTRUCTION: the Twilio TwiML that starts the call has
+// <Dial>Chris's cell</Dial> AFTER the <Connect>. If this service is down, the
+// websocket never opens and the caller lands on Chris — pre-Aggie behavior,
+// automatically. When Aggie finishes a call ("done"), we hang the call up via
+// Twilio REST so it never falls through to that Dial.
+// ============================================================================
+'use strict';
+
+const http = require('http');
+const { WebSocketServer } = require('ws');
+
+// ---- config (all via environment; render.yaml wires these) -----------------
+const PORT       = process.env.PORT || 10000;
+const ANTHROPIC  = process.env.ANTHROPIC_API_KEY || '';
+const GAS_URL    = (process.env.GAS_EXEC_URL || '').replace(/\/+$/, ''); // full /exec URL, no query
+const WKEY       = process.env.WEBHOOK_KEY || '';
+const RELAY_TOKEN= process.env.RELAY_TOKEN || '';          // shared secret in the wss URL (?t=...)
+const TW_SID     = process.env.TWILIO_ACCOUNT_SID || '';
+const TW_TOKEN   = process.env.TWILIO_AUTH_TOKEN || '';
+const CHRIS_CELL = process.env.CHRIS_CELL || '';           // transfer target, E.164
+const MODEL      = process.env.AGGIE_MODEL || 'claude-sonnet-4-6';
+const MAX_TOKENS = Number(process.env.AGGIE_MAX_TOKENS || 500);
+
+// ---- nothing fails silently: ring buffer surfaced at /health ---------------
+const errs = [];
+function logErr(where, e) {
+  const line = new Date().toISOString() + ' ' + where + ': ' + String((e && e.message) || e);
+  console.error(line);
+  errs.push(line);
+  while (errs.length > 30) errs.shift();
+}
+function logInfo(msg) { console.log(new Date().toISOString() + ' ' + msg); }
+
+// ---- brainpack cache --------------------------------------------------------
+// Generic brain refreshed every 4 minutes (mirrors GAS-side cache TTL). A
+// caller-specific pack (dossier included) is raced at ring time with a hard
+// timeout — if GAS is slow, the generic brain answers and the call NEVER waits.
+let genericPack = null;          // { sys, greeting, vm, model, v, at }
+let genericAt   = 0;
+
+async function fetchPack(phone, timeoutMs) {
+  const ctl = new AbortController();
+  const tm = setTimeout(() => ctl.abort(), timeoutMs);
+  try {
+    const u = GAS_URL + '?hook=brainpack&k=' + encodeURIComponent(WKEY) +
+              (phone ? '&phone=' + encodeURIComponent(phone) : '');
+    const r = await fetch(u, { signal: ctl.signal, redirect: 'follow' });
+    const j = await r.json();
+    if (j && j.ok && j.sys) return j;
+    throw new Error('bad pack: ' + JSON.stringify(j).slice(0, 120));
+  } finally { clearTimeout(tm); }
+}
+async function refreshGeneric() {
+  try {
+    genericPack = await fetchPack('', 25000);
+    genericAt = Date.now();
+    logInfo('brainpack refreshed (v' + genericPack.v + ', ' + genericPack.sys.length + ' chars)');
+  } catch (e) { logErr('brainpack.refresh', e); }
+}
+refreshGeneric();
+setInterval(refreshGeneric, 4 * 60 * 1000);
+
+// ---- Anthropic streaming with live "reply" extraction -----------------------
+// Aggie answers in strict JSON: {"reply":"...","done":...,"lead":{...}}. To get
+// sub-second first-word latency we do NOT wait for the whole JSON — a tiny
+// state machine watches the token stream for  "reply":"  and forwards the reply
+// text to Twilio TTS character-for-character as it is generated, handling JSON
+// escapes on the fly. The full raw text is kept and parsed at the end for the
+// control fields (done / transfer / flagOwner / lead / sched).
+function replyExtractor(emit) {
+  let mode = 0;            // 0 = hunting for "reply":" · 1 = inside reply · 2 = done
+  let hunt = '';
+  let esc = false, uni = '';
+  return function feed(chunk) {
+    for (const ch of chunk) {
+      if (mode === 0) {
+        hunt += ch;
+        if (hunt.length > 400) hunt = hunt.slice(-40);
+        if (/"reply"\s*:\s*"$/.test(hunt)) mode = 1;
+      } else if (mode === 1) {
+        if (uni) { uni += ch; if (uni.length === 5) { emit(String.fromCharCode(parseInt(uni.slice(1), 16) || 32)); uni = ''; } continue; }
+        if (esc) {
+          esc = false;
+          if (ch === 'n' || ch === 't') emit(' ');
+          else if (ch === 'u') uni = 'u';
+          else emit(ch);                       // \" \\ \/ etc
+        }
+        else if (ch === '\\') esc = true;
+        else if (ch === '"') mode = 2;         // unescaped close quote — reply over
+        else emit(ch);
+      }
+    }
+  };
+}
+
+async function aiTurn(sys, convo, onReplyText, signal) {
+  const r = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    signal,
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': ANTHROPIC,
+      'anthropic-version': '2023-06-01'
+    },
+    body: JSON.stringify({ model: MODEL, max_tokens: MAX_TOKENS, system: sys, messages: convo, stream: true })
+  });
+  if (!r.ok) throw new Error('anthropic ' + r.status + ': ' + (await r.text()).slice(0, 200));
+  const feed = replyExtractor(onReplyText);
+  let raw = '';
+  const reader = r.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let ix;
+    while ((ix = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, ix).trim(); buf = buf.slice(ix + 1);
+      if (!line.startsWith('data:')) continue;
+      const data = line.slice(5).trim();
+      if (data === '[DONE]') continue;
+      try {
+        const ev = JSON.parse(data);
+        const t = ev && ev.delta && ev.delta.text;
+        if (t) { raw += t; feed(t); }
+      } catch (e) { /* partial SSE line — ignored */ }
+    }
+  }
+  return raw;
+}
+
+// Same tolerant parse GAS uses (vrParse_ spirit): full JSON first, regex rescue
+// for truncated output, raw-speech fallback last.
+function parseTurn(raw) {
+  const t = String(raw || '').trim();
+  try {
+    const m = t.match(/\{[\s\S]*\}/);
+    if (m) { const j = JSON.parse(m[0]); if (j && j.reply) return j; }
+  } catch (e) {}
+  const m2 = /"reply"\s*:\s*"((?:[^"\\]|\\.)*)/.exec(t);
+  if (m2) {
+    const lead = {};
+    for (const k of ['name','address','phone','email','pest','service','day','window','notes']) {
+      const mm = new RegExp('"' + k + '"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"').exec(t);
+      if (mm) lead[k] = mm[1].replace(/\\"/g, '"');
+    }
+    return {
+      reply: m2[1].replace(/\\"/g, '"').replace(/\\n/g, ' ').replace(/\\u([0-9a-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16))).replace(/\\\\/g, '\\'),
+      done: /"done"\s*:\s*true/.test(t), flagOwner: /"flagOwner"\s*:\s*true/.test(t),
+      commercial: /"commercial"\s*:\s*true/.test(t), transfer: /"transfer"\s*:\s*true/.test(t),
+      lead
+    };
+  }
+  if (t && !t.startsWith('{')) return { reply: t.slice(0, 400) };
+  return null;
+}
+
+// ---- Twilio REST helpers (transfer + graceful hangup, no GAS in the path) ---
+async function twilioUpdateCall(callSid, twiml) {
+  const u = 'https://api.twilio.com/2010-04-01/Accounts/' + TW_SID + '/Calls/' + callSid + '.json';
+  const r = await fetch(u, {
+    method: 'POST',
+    headers: {
+      'authorization': 'Basic ' + Buffer.from(TW_SID + ':' + TW_TOKEN).toString('base64'),
+      'content-type': 'application/x-www-form-urlencoded'
+    },
+    body: 'Twiml=' + encodeURIComponent(twiml)
+  });
+  if (!r.ok) throw new Error('twilio update ' + r.status + ': ' + (await r.text()).slice(0, 200));
+}
+const xesc = s => String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+
+// ---- results ramp: POST the finished call to GAS, with patient retries ------
+async function postResults(payload) {
+  const body = JSON.stringify(payload);
+  const u = GAS_URL + '?hook=relay&k=' + encodeURIComponent(WKEY);
+  const waits = [0, 3000, 12000, 40000];
+  for (let i = 0; i < waits.length; i++) {
+    if (waits[i]) await new Promise(res => setTimeout(res, waits[i]));
+    try {
+      const r = await fetch(u, { method: 'POST', headers: { 'content-type': 'application/json' }, body, redirect: 'follow' });
+      const txt = await r.text();
+      if (r.ok && txt.trim() === 'ok') { logInfo('results landed for ' + payload.sid); return; }
+      throw new Error('gas said: ' + txt.slice(0, 120));
+    } catch (e) { logErr('results.try' + (i + 1), e); }
+  }
+  logErr('results.FINAL', 'all retries failed for ' + payload.sid + ' — Twilio reconciliation sweep will backfill');
+}
+
+// ---- per-call session -------------------------------------------------------
+const sessions = new Map();   // ws -> session
+let callsHandled = 0;
+
+function newSession(ws) {
+  return {
+    ws, callSid: '', from: '', to: '', startedAt: Date.now(),
+    convo: [],                 // [{role,content}] — assistant turns store REPLY TEXT, same as GAS
+    lead: {},                  // monotonic merge across turns — a fact once given is never lost
+    flag: false, commercial: false, tierOffered: false, tierTaken: '',
+    sched: null, done: false, finalized: false,
+    packPromise: null, pack: null,
+    ctl: null                  // AbortController of the in-flight AI turn
+  };
+}
+
+function mergeLead(into, from) {
+  if (!from) return;
+  for (const k of Object.keys(from)) {
+    const v = String(from[k] || '').trim();
+    if (v) into[k] = v;
+  }
+}
+
+function sendText(ws, token, last) {
+  try { ws.send(JSON.stringify({ type: 'text', token, last: !!last })); } catch (e) { logErr('ws.send', e); }
+}
+
+async function handlePrompt(s, voicePrompt) {
+  // a new utterance always cancels a stale in-flight turn (barge-in via speech)
+  if (s.ctl) { try { s.ctl.abort(); } catch (e) {} }
+  s.convo.push({ role: 'user', content: String(voicePrompt).slice(0, 500) });
+
+  // brain: caller-specific if it arrived, generic otherwise — never wait long
+  if (!s.pack) {
+    try { s.pack = await Promise.race([ s.packPromise, new Promise(res => setTimeout(() => res(null), 1200)) ]); } catch (e) {}
+    if (!s.pack) s.pack = genericPack;
+  }
+  if (!s.pack) {                       // cold boot AND GAS down — human net
+    sendText(s.ws, 'One moment while I connect you to the team.', true);
+    return doTransfer(s, 'no brain available');
+  }
+  const sys = String(s.pack.sys).replace(/\{\{CALLER_ID\}\}/g, s.from || 'unknown');
+
+  const ctl = new AbortController();
+  s.ctl = ctl;
+  let spoke = false;
+  let raw = '';
+  try {
+    raw = await aiTurn(sys, s.convo, tok => { spoke = true; sendText(s.ws, tok, false); }, ctl.signal);
+  } catch (e) {
+    if (ctl.signal.aborted) return;    // superseded by a newer utterance — say nothing
+    logErr('aiTurn', e);
+    sendText(s.ws, 'Sorry, I hit a snag on my end — one moment while I get Chris for you.', true);
+    return doTransfer(s, 'AI turn failed');
+  } finally { if (s.ctl === ctl) s.ctl = null; }
+
+  const d = parseTurn(raw);
+  if (!d || !d.reply) {
+    logErr('parse', 'unparseable: ' + raw.slice(0, 160));
+    if (!spoke) sendText(s.ws, 'Sorry, say that one more time for me?', true);
+    else sendText(s.ws, '', true);
+    return;
+  }
+  if (!spoke) sendText(s.ws, d.reply, true);   // extractor missed (odd formatting) — speak the parsed reply
+  else sendText(s.ws, '', true);               // close the utterance
+
+  s.convo.push({ role: 'assistant', content: String(d.reply).slice(0, 500) });
+  mergeLead(s.lead, d.lead);
+  if (d.flagOwner) s.flag = true;
+  if (d.commercial) s.commercial = true;
+  if (d.tierOffered) s.tierOffered = true;
+  if (d.tierTaken) s.tierTaken = String(d.tierTaken);
+  if (d.sched && d.sched.action) s.sched = d.sched;
+
+  if (d.transfer) return doTransfer(s, 'caller asked');
+  if (d.done) {
+    s.done = true;
+    // let TTS finish the closing recap, then hang up so the call never falls
+    // through to the safety-net <Dial> and rings Chris after a booked call.
+    const secs = Math.min(20, Math.max(4, Math.round(String(d.reply).split(/\s+/).length / 2.4) + 2));
+    setTimeout(async () => {
+      try { await twilioUpdateCall(s.callSid, '<Response><Hangup/></Response>'); } catch (e) { logErr('hangup', e); }
+    }, secs * 1000);
+  }
+}
+
+async function doTransfer(s, why) {
+  logInfo('transfer (' + why + ') ' + s.callSid);
+  s.flag = true;
+  try {
+    await twilioUpdateCall(s.callSid,
+      '<Response><Say>One moment while I connect you.</Say><Dial timeout="25">' + xesc(CHRIS_CELL) + '</Dial>' +
+      '<Say>Sorry — we could not grab the phone. We have your number and will call you right back.</Say><Hangup/></Response>');
+  } catch (e) { logErr('transfer', e); }
+}
+
+function finalize(s) {
+  if (s.finalized || !s.callSid) return;
+  s.finalized = true;
+  const secs = Math.max(1, Math.round((Date.now() - s.startedAt) / 1000));
+  const hasLead = s.lead && (s.lead.name || s.lead.address || s.lead.pest);
+  postResults({
+    sid: s.callSid, from: s.from, to: s.to, ts: new Date(s.startedAt).toISOString(),
+    convo: s.convo.slice(-24),
+    lead: hasLead ? s.lead : null,
+    flag: s.flag, commercial: s.commercial,
+    tierOffered: s.tierOffered, tierTaken: s.tierTaken,
+    sched: s.sched, secs,
+    needsSlot: !!(s.done && hasLead && !s.lead.window),
+    done: s.done
+  }).catch(e => logErr('finalize', e));
+}
+
+// ---- HTTP (health + keep-warm target) ---------------------------------------
+const server = http.createServer((req, res) => {
+  if (req.url && req.url.startsWith('/health')) {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      ok: true, up: Math.round(process.uptime()),
+      brainAgeSec: genericPack ? Math.round((Date.now() - genericAt) / 1000) : null,
+      brainVersion: genericPack ? genericPack.v : null,
+      model: MODEL, callsHandled, liveCalls: sessions.size,
+      recentErrors: errs.slice(-8)
+    }, null, 2));
+    return;
+  }
+  res.writeHead(200, { 'content-type': 'text/plain' });
+  res.end('Aggie gateway. Nothing to see here — the telephone is at /relay (websocket).');
+});
+
+// ---- WebSocket: the Twilio ConversationRelay protocol -----------------------
+const wss = new WebSocketServer({ noServer: true });
+server.on('upgrade', (req, socket, head) => {
+  const u = new URL(req.url, 'http://x');
+  if (u.pathname !== '/relay' || (RELAY_TOKEN && u.searchParams.get('t') !== RELAY_TOKEN)) {
+    socket.destroy(); return;
+  }
+  wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws));
+});
+
+wss.on('connection', ws => {
+  const s = newSession(ws);
+  sessions.set(ws, s);
+  ws.on('message', msg => {
+    let m = null;
+    try { m = JSON.parse(msg); } catch (e) { return; }
+    if (m.type === 'setup') {
+      s.callSid = String(m.callSid || '');
+      s.from = String(m.from || '');
+      s.to = String(m.to || '');
+      callsHandled++;
+      logInfo('call ' + s.callSid + ' from ' + s.from);
+      // race the caller-specific brain (dossier inside) against the clock
+      s.packPromise = fetchPack(s.from, 6000).catch(e => { logErr('pack.caller', e); return null; });
+    }
+    else if (m.type === 'prompt' && m.voicePrompt) {
+      handlePrompt(s, m.voicePrompt).catch(e => logErr('handlePrompt', e));
+    }
+    else if (m.type === 'interrupt') {
+      if (s.ctl) { try { s.ctl.abort(); } catch (e) {} }
+    }
+    else if (m.type === 'error') {
+      logErr('relay.error', m.description || JSON.stringify(m).slice(0, 200));
+    }
+  });
+  ws.on('close', () => { sessions.delete(ws); finalize(s); });
+  ws.on('error', e => { logErr('ws', e); });
+});
+
+server.listen(PORT, () => logInfo('Aggie gateway listening on :' + PORT + ' (model ' + MODEL + ')'));

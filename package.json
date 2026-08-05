@@ -1,0 +1,10 @@
+{
+  "name": "aggie-gateway",
+  "version": "1.0.0",
+  "description": "Aggie's new telephone — Twilio ConversationRelay voice gateway for Apex Pest Solutions",
+  "main": "server.js",
+  "type": "commonjs",
+  "engines": { "node": ">=20" },
+  "scripts": { "start": "node server.js" },
+  "dependencies": { "ws": "^8.18.0" }
+}
