@@ -28,7 +28,7 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 
 // ---- config (all via environment; render.yaml wires these) -----------------
-const GW_VERSION = '1.2';
+const GW_VERSION = '1.3';
 const PORT       = process.env.PORT || 10000;
 const ANTHROPIC  = process.env.ANTHROPIC_API_KEY || '';
 const GAS_URL    = (process.env.GAS_EXEC_URL || '').replace(/\/+$/, ''); // full /exec URL, no query
@@ -57,11 +57,12 @@ function logInfo(msg) { console.log(new Date().toISOString() + ' ' + msg); }
 let genericPack = null;          // { sys, greeting, vm, model, v, at }
 let genericAt   = 0;
 
-async function fetchPack(phone, timeoutMs) {
+async function fetchPack(phone, timeoutMs, mid) {
   const ctl = new AbortController();
   const tm = setTimeout(() => ctl.abort(), timeoutMs);
   try {
     const u = GAS_URL + '?hook=brainpack&k=' + encodeURIComponent(WKEY) +
+              (mid ? '&mid=' + encodeURIComponent(mid) : '') +
               (phone ? '&phone=' + encodeURIComponent(phone) : '');
     const r = await fetch(u, { signal: ctl.signal, redirect: 'follow' });
     const j = await r.json();
@@ -239,7 +240,7 @@ function newSession(ws) {
     lead: {},                  // monotonic merge across turns — a fact once given is never lost
     flag: false, commercial: false, tierOffered: false, tierTaken: '',
     sched: null, done: false, finalized: false,
-    packPromise: null, pack: null, callerPack: null, recStarted: false,
+    packPromise: null, pack: null, callerPack: null, recStarted: false, mid: '',
     ctl: null                  // AbortController of the in-flight AI turn
   };
 }
@@ -343,7 +344,7 @@ function finalize(s) {
   const secs = Math.max(1, Math.round((Date.now() - s.startedAt) / 1000));
   const hasLead = s.lead && (s.lead.name || s.lead.address || s.lead.pest);
   postResults({
-    sid: s.callSid, from: s.from, to: s.to, dir: s.dir, ts: new Date(s.startedAt).toISOString(),
+    sid: s.callSid, from: s.from, to: s.to, dir: s.dir, mid: s.mid || '', ts: new Date(s.startedAt).toISOString(),
     convo: s.convo.slice(-24),
     lead: hasLead ? s.lead : null,
     flag: s.flag, commercial: s.commercial,
@@ -378,11 +379,13 @@ server.on('upgrade', (req, socket, head) => {
   if (u.pathname !== '/relay' || (RELAY_TOKEN && u.searchParams.get('t') !== RELAY_TOKEN)) {
     socket.destroy(); return;
   }
-  wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws));
+  const mid = u.searchParams.get('mid') || '';
+  wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, mid));
 });
 
-wss.on('connection', ws => {
+wss.on('connection', (ws, mid) => {
   const s = newSession(ws);
+  s.mid = String(mid || '');   // v1.3: present = this is a MISSION call
   sessions.set(ws, s);
   ws.on('message', msg => {
     let m = null;
@@ -400,7 +403,9 @@ wss.on('connection', ws => {
       callsHandled++;
       logInfo('call ' + s.callSid + ' from ' + s.from);
       // race the caller-specific brain (dossier inside) against the clock
-      s.packPromise = fetchPack(s.from, 25000)
+      // v1.3 MISSIONS: an assignment brain, fetched by mid — never the
+      // receptionist booking script. Same race, same patience, same rails.
+      s.packPromise = (s.mid ? fetchPack('', 25000, s.mid) : fetchPack(s.from, 25000))
         .then(p => { if (p) { s.callerPack = p; logInfo('caller pack landed for ' + s.callSid); } return p; })
         .catch(e => { logErr('pack.caller', e); return null; });
       startRecording(s);   // v1.1: every live call is recorded, like v23.5 days
