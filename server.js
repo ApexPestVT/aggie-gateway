@@ -28,7 +28,7 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 
 // ---- config (all via environment; render.yaml wires these) -----------------
-const GW_VERSION = '1.5';
+const GW_VERSION = '1.6';
 const PORT       = process.env.PORT || 10000;
 const ANTHROPIC  = process.env.ANTHROPIC_API_KEY || '';
 const GAS_URL    = (process.env.GAS_EXEC_URL || '').replace(/\/+$/, ''); // full /exec URL, no query
@@ -371,7 +371,11 @@ function finalize(s) {
     sid: s.callSid, from: s.from, to: s.to, dir: s.dir, mid: s.mid || '',
     endWhy: s.endWhy || (s.done ? 'completed' : 'caller hung up'),   // v1.4: never guess again why a call ended
     ts: new Date(s.startedAt).toISOString(),
-    convo: s.convo.slice(-24),
+    // v1.6 THE FIRST HALF OF THE CALL WAS BEING THROWN AWAY. A 24-turn cap
+    // meant any conversation longer than a dozen exchanges arrived in APS with
+    // its opening missing \u2014 the pest, the town, the address, all the parts that
+    // matter most \u2014 and the thread appeared to start in the middle of nowhere.
+    convo: s.convo.slice(-80),
     lead: hasLead ? s.lead : null,
     flag: s.flag || s.needsCallback, commercial: s.commercial, needsCallback: !!s.needsCallback,
     tierOffered: s.tierOffered, tierTaken: s.tierTaken,
