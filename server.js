@@ -28,7 +28,7 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 
 // ---- config (all via environment; render.yaml wires these) -----------------
-const GW_VERSION = '1.3';
+const GW_VERSION = '1.5';
 const PORT       = process.env.PORT || 10000;
 const ANTHROPIC  = process.env.ANTHROPIC_API_KEY || '';
 const GAS_URL    = (process.env.GAS_EXEC_URL || '').replace(/\/+$/, ''); // full /exec URL, no query
@@ -240,7 +240,7 @@ function newSession(ws) {
     lead: {},                  // monotonic merge across turns — a fact once given is never lost
     flag: false, commercial: false, tierOffered: false, tierTaken: '',
     sched: null, done: false, finalized: false,
-    packPromise: null, pack: null, callerPack: null, recStarted: false, mid: '',
+    packPromise: null, pack: null, callerPack: null, recStarted: false, mid: '', endWhy: '', needsCallback: false,
     ctl: null                  // AbortController of the in-flight AI turn
   };
 }
@@ -319,6 +319,7 @@ async function handlePrompt(s, voicePrompt) {
   if (d.transfer) return doTransfer(s, 'caller asked');
   if (d.done) {
     s.done = true;
+    s.endWhy = 'completed';
     // let TTS finish the closing recap, then hang up so the call never falls
     // through to the safety-net <Dial> and rings Chris after a booked call.
     const secs = Math.min(20, Math.max(4, Math.round(String(d.reply).split(/\s+/).length / 2.4) + 2));
@@ -329,12 +330,35 @@ async function handlePrompt(s, voicePrompt) {
 }
 
 async function doTransfer(s, why) {
+  // v1.4: SHE DID NOT KNOW SHE TRANSFERRED. Her websocket closes the instant
+  // the call moves to Chris, so her record ended mid-sentence and looked to
+  // everyone — including her — like the call dropped. Now the handoff is
+  // written into the conversation itself, so the transcript, the thread, and
+  // her memory of the customer all say plainly what happened.
   logInfo('transfer (' + why + ') ' + s.callSid);
   s.flag = true;
+  s.endWhy = 'transferred:' + why;
+  s.needsCallback = true;   // v1.5: they asked for a human — never let this go quiet
+  s.convo.push({ role: 'assistant', content: '[TRANSFERRED TO CHRIS — ' + why + '. The rest of this conversation happened between the caller and Chris; the full call recording has it.]' });
+  // v1.5 A TRANSFER NOBODY ANSWERS USED TO END THE LEAD. The old TwiML rang
+  // Chris for 25 seconds, promised a callback, and hung up: no voicemail, no
+  // flag, and no rescue (the call reads 'completed', so the missed-call sweep
+  // never looks at it). A caller who ASKED for a human is the hottest lead of
+  // the day and it evaporated. Three fixes here:
+  //   answerOnBridge — the caller hears real ringing, not silence, and the
+  //     call is not marked answered until Chris actually picks up
+  //   timeout 20  — beats a Verizon voicemail pickup, so the caller lands on
+  //     OUR recorder instead of Chris's personal greeting, where APS can see it
+  //   Record      — the promise is kept: a message is taken, transcribed, and
+  //     lands in the customer's thread through the same hook as every voicemail
+  const recCb = GAS_URL + '?hook=rec&k=' + encodeURIComponent(WKEY) + '&vm=1';
   try {
     await twilioUpdateCall(s.callSid,
-      '<Response><Say>One moment while I connect you.</Say><Dial timeout="25">' + xesc(CHRIS_CELL) + '</Dial>' +
-      '<Say>Sorry — we could not grab the phone. We have your number and will call you right back.</Say><Hangup/></Response>');
+      '<Response><Say>One moment while I connect you.</Say>' +
+      '<Dial timeout="20" answerOnBridge="true">' + xesc(CHRIS_CELL) + '</Dial>' +
+      '<Say>Sorry, he could not grab the phone. Leave your name, number, and what you are seeing after the tone, and we will call you right back.</Say>' +
+      '<Record maxLength="120" playBeep="true" recordingStatusCallback="' + xesc(recCb) + '"/>' +
+      '<Say>Thanks. We will be in touch shortly.</Say><Hangup/></Response>');
   } catch (e) { logErr('transfer', e); }
 }
 
@@ -344,10 +368,12 @@ function finalize(s) {
   const secs = Math.max(1, Math.round((Date.now() - s.startedAt) / 1000));
   const hasLead = s.lead && (s.lead.name || s.lead.address || s.lead.pest);
   postResults({
-    sid: s.callSid, from: s.from, to: s.to, dir: s.dir, mid: s.mid || '', ts: new Date(s.startedAt).toISOString(),
+    sid: s.callSid, from: s.from, to: s.to, dir: s.dir, mid: s.mid || '',
+    endWhy: s.endWhy || (s.done ? 'completed' : 'caller hung up'),   // v1.4: never guess again why a call ended
+    ts: new Date(s.startedAt).toISOString(),
     convo: s.convo.slice(-24),
     lead: hasLead ? s.lead : null,
-    flag: s.flag, commercial: s.commercial,
+    flag: s.flag || s.needsCallback, commercial: s.commercial, needsCallback: !!s.needsCallback,
     tierOffered: s.tierOffered, tierTaken: s.tierTaken,
     sched: s.sched, secs,
     needsSlot: !!(s.done && hasLead && !s.lead.window),
