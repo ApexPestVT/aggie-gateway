@@ -28,7 +28,7 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 
 // ---- config (all via environment; render.yaml wires these) -----------------
-const GW_VERSION = '1.6';
+const GW_VERSION = '1.7';
 const PORT       = process.env.PORT || 10000;
 const ANTHROPIC  = process.env.ANTHROPIC_API_KEY || '';
 const GAS_URL    = (process.env.GAS_EXEC_URL || '').replace(/\/+$/, ''); // full /exec URL, no query
@@ -42,6 +42,9 @@ const MAX_TOKENS = Number(process.env.AGGIE_MAX_TOKENS || 500);
 
 // ---- nothing fails silently: ring buffer surfaced at /health ---------------
 const errs = [];
+// v1.7: the API reports cache reads on the opening event of each turn. Keeping
+// the last numbers means caching can be PROVEN on /health, not just believed.
+let lastUsage = null;
 function logErr(where, e) {
   const line = new Date().toISOString() + ' ' + where + ': ' + String((e && e.message) || e);
   console.error(line);
@@ -122,7 +125,18 @@ async function aiTurn(sys, convo, onReplyText, signal) {
       'x-api-key': ANTHROPIC,
       'anthropic-version': '2023-06-01'
     },
-    body: JSON.stringify({ model: MODEL, max_tokens: MAX_TOKENS, system: sys, messages: convo, stream: true })
+    // v1.7 THE BRAIN WAS RE-SENT ON EVERY SINGLE TURN. Aggie's system prompt is
+    // the whole canon, the dossier, the availability \u2014 tens of thousands of
+    // tokens \u2014 and a ten-turn call paid for it ten times over. 87.7M tokens in a
+    // week is what pushed the account into its spend cap mid-morning and took
+    // her brain offline. Marking it cacheable means the first turn of a call
+    // pays full price and every turn after reads from cache at a tenth the
+    // cost. Same prompt, same behaviour, same voice \u2014 only the bill changes.
+    body: JSON.stringify({
+      model: MODEL, max_tokens: MAX_TOKENS,
+      system: [{ type: 'text', text: sys, cache_control: { type: 'ephemeral' } }],
+      messages: convo, stream: true
+    })
   });
   if (!r.ok) throw new Error('anthropic ' + r.status + ': ' + (await r.text()).slice(0, 200));
   const feed = replyExtractor(onReplyText);
@@ -142,6 +156,15 @@ async function aiTurn(sys, convo, onReplyText, signal) {
       if (data === '[DONE]') continue;
       try {
         const ev = JSON.parse(data);
+        try {
+          const u = ev && ev.message && ev.message.usage;
+          if (u) lastUsage = {
+            at: new Date().toISOString(),
+            input: u.input_tokens || 0,
+            cacheWrite: u.cache_creation_input_tokens || 0,
+            cacheRead: u.cache_read_input_tokens || 0
+          };
+        } catch (eU) {}
         const t = ev && ev.delta && ev.delta.text;
         if (t) { raw += t; feed(t); }
       } catch (e) { /* partial SSE line — ignored */ }
@@ -394,6 +417,7 @@ const server = http.createServer((req, res) => {
       brainAgeSec: genericPack ? Math.round((Date.now() - genericAt) / 1000) : null,
       brainVersion: genericPack ? genericPack.v : null,
       model: MODEL, callsHandled, liveCalls: sessions.size,
+      promptCache: lastUsage || 'no turns yet since restart',
       recentErrors: errs.slice(-8)
     }, null, 2));
     return;
