@@ -378,7 +378,10 @@ async function doTransfer(s, why) {
   try {
     await twilioUpdateCall(s.callSid,
       '<Response><Say>One moment while I connect you.</Say>' +
-      '<Dial timeout="20" answerOnBridge="true">' + xesc(CHRIS_CELL) + '</Dial>' +
+      // v1.7 GUARDED BACKUP (owner: 'guard it'): the bridged human leg records
+      // too. GAS treats leg=xfer as SECONDARY \u2014 it can never overwrite the
+      // call-level recording; it only steps in if that one never arrived.
+      '<Dial timeout="20" answerOnBridge="true" record="record-from-answer" recordingStatusCallback="' + xesc(GAS_URL + '?hook=rec&k=' + encodeURIComponent(WKEY) + '&leg=xfer') + '">' + xesc(CHRIS_CELL) + '</Dial>' +
       '<Say>Sorry, he could not grab the phone. Leave your name, number, and what you are seeing after the tone, and we will call you right back.</Say>' +
       '<Record maxLength="120" playBeep="true" recordingStatusCallback="' + xesc(recCb) + '"/>' +
       '<Say>Thanks. We will be in touch shortly.</Say><Hangup/></Response>');
