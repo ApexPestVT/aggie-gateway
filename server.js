@@ -387,6 +387,20 @@ async function handlePrompt(s, voicePrompt) {
   if (d.act && d.act.action && s.callerPack && s.callerPack.owner === true) {
     try {
       const r = await postVoiceAct(s, d.act);
+      // v1.10 A LOOKUP IS A THOUGHT, NOT A LINE. The record goes back into the
+      // conversation as a note and she takes another turn with it in hand —
+      // the owner hears the answer, never the raw dump.
+      if (d.act.action === 'lookup') {
+        const note = '[LOOKUP RESULT] ' + String((r && r.result) || (r && r.error) || 'no answer').slice(0, 900);
+        s.convo.push({ role: 'user', content: note });
+        const sys2 = sys;
+        let raw2 = '';
+        try { raw2 = await aiTurn(sys2, s.convo, tok => sendText(s.ws, tok, false), null); } catch (e) { logErr('lookupTurn', e); }
+        const d2 = parseTurn(raw2);
+        if (d2 && d2.reply) { sendText(s.ws, '', true); s.convo.push({ role: 'assistant', content: String(d2.reply).slice(0, 500) }); }
+        else sendText(s.ws, 'Here is what I have: ' + note.replace(/^\[LOOKUP RESULT\] /, '').slice(0, 240), true);
+        return;
+      }
       const said = r && r.ok ? String(r.result || 'Done.').replace(/[\u2714\u2716\u2717\u23f3\ud83d\udcc5\u260e]/g, '').trim().slice(0, 240) : ('That did not go through: ' + String((r && r.error) || 'no answer from the office').slice(0, 120));
       sendText(s.ws, said, true);
       s.convo.push({ role: 'assistant', content: '[ran ' + d.act.action + ': ' + said.slice(0, 200) + ']' });
