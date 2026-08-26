@@ -2,7 +2,7 @@
 // AGGIE'S NEW TELEPHONE — Voice Gateway v1.2 (Twilio ConversationRelay <-> Anthropic)
 // v1.2: outbound rescues ride this road too — customer number derived from
 // direction, call rows labeled correctly, and /health confesses its version.
-// Apex Pest Solutions · pairs with APS 2.0 v34.11 (hook=brainpack / hook=relay)
+// Apex Pest Solutions · pairs with APS 2.0 v34.11+ (hook=brainpack / hook=relay / hook=voiceact since v1.9)
 //
 // WHY THIS EXISTS: Google Apps Script's front door degrades under daytime load
 // (verified: same code, 4 AM pass / 11 AM 502, GAS error log empty — the code
@@ -179,7 +179,7 @@ function parseTurn(raw) {
   const t = String(raw || '').trim();
   try {
     const m = t.match(/\{[\s\S]*\}/);
-    if (m) { const j = JSON.parse(m[0]); if (j && j.reply) return j; }
+    if (m) { const j = JSON.parse(m[0]); if (j && j.reply) return j; }   // v1.9: `act` (owner line) rides through untouched
   } catch (e) {}
   const m2 = /"reply"\s*:\s*"((?:[^"\\]|\\.)*)/.exec(t);
   if (m2) {
@@ -252,6 +252,18 @@ async function postResults(payload) {
   logErr('results.FINAL', 'all retries failed for ' + payload.sid + ' — Twilio reconciliation sweep will backfill');
 }
 
+// v1.9: owner-line action ramp (one try, 20s — the owner is waiting on the line)
+async function postVoiceAct(s, act) {
+  const u = GAS_URL + '?hook=voiceact&k=' + encodeURIComponent(WKEY);
+  const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), 20000);
+  try {
+    const r = await fetch(u, { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sid: s.callSid, from: s.from, act }), redirect: 'follow', signal: ctl.signal });
+    const txt = await r.text();
+    try { return JSON.parse(txt); } catch (e) { return { ok: false, error: 'unreadable: ' + txt.slice(0, 80) }; }
+  } finally { clearTimeout(tm); }
+}
+
 // ---- per-call session -------------------------------------------------------
 const sessions = new Map();   // ws -> session
 let callsHandled = 0;
@@ -288,8 +300,44 @@ async function handlePrompt(s, voicePrompt) {
   // v1.1 brain choice, EVERY turn: the caller-specific pack (their dossier
   // inside) wins the moment it lands — even mid-call. First turn races it
   // briefly, then falls to the generic brain rather than keep a human waiting.
+  // v1.8 THE 1.2-SECOND RACE LOST EVERY TIME (Arlena Taylor, 8/25). Apps
+  // Script answers a brainpack in 2-8s; the first turn waited 1.2s, then ran
+  // the GENERIC receptionist on a customer we know (asked a Tiers customer
+  // 'what pest are you dealing with?') and, on a MISSION callback, opened
+  // with 'how can I help you today?' to a person we had just dialed. Now:
+  //   mission  - the generic brain is never an option. Wait for the mission
+  //              pack (filler after 2s), and if it truly cannot come, say so
+  //              honestly, flag the owner, and end \u2014 never impersonate the
+  //              front desk on an outbound call.
+  //   inbound  - wait 3s silently, then one filler line, then up to 6s more
+  //              for the caller's dossier before falling to generic. A known
+  //              customer is worth four seconds; a stranger's pack lands in
+  //              the same window anyway.
   if (!s.callerPack) {
-    try { await Promise.race([ s.packPromise, new Promise(res => setTimeout(res, 1200)) ]); } catch (e) {}
+    const first = !s._packWaited;
+    s._packWaited = true;
+    if (s.mid) {
+      try { await Promise.race([ s.packPromise, new Promise(res => setTimeout(res, 2000)) ]); } catch (e) {}
+      if (!s.callerPack) {
+        sendText(s.ws, 'One moment.', true);
+        try { await Promise.race([ s.packPromise, new Promise(res => setTimeout(res, 12000)) ]); } catch (e) {}
+      }
+      if (!s.callerPack) {
+        logErr('pack.mission', 'no mission pack for ' + s.callSid + ' (mid ' + s.mid + ') \u2014 refusing to run the receptionist on an outbound call');
+        s.flag = true; s.needsCallback = true; s.endWhy = 'mission brain missing';
+        s.convo.push({ role: 'assistant', content: '[MISSION ABORTED \u2014 assignment brain never arrived; owner flagged to call back personally]' });
+        sendText(s.ws, 'Sorry \u2014 I am having a technical moment on my end. Chris will give you a call back shortly. Thanks for picking up.', true);
+        setTimeout(async () => { try { await twilioUpdateCall(s.callSid, '<Response><Hangup/></Response>'); } catch (e) { logErr('hangup', e); } }, 7000);
+        return;
+      }
+    } else {
+      try { await Promise.race([ s.packPromise, new Promise(res => setTimeout(res, first ? 3000 : 800)) ]); } catch (e) {}
+      if (!s.callerPack && first) {
+        sendText(s.ws, 'One second while I pull up your account.', true);
+        try { await Promise.race([ s.packPromise, new Promise(res => setTimeout(res, 6000)) ]); } catch (e) {}
+        if (!s.callerPack) logErr('pack.late', 'caller pack still not landed after 9s for ' + s.callSid + ' \u2014 first turn runs generic');
+      }
+    }
   }
   let pack = s.callerPack || genericPack;
   if (!pack) {
@@ -332,6 +380,20 @@ async function handlePrompt(s, voicePrompt) {
   else sendText(s.ws, '', true);               // close the utterance
 
   s.convo.push({ role: 'assistant', content: String(d.reply).slice(0, 500) });
+  // v1.9 THE OWNER LINE. When the pack said owner:true, the brain is AGI and a
+  // turn may carry `act` — a chat-bubble action the owner just approved out
+  // loud. Post it to GAS (hook=voiceact, owner-number checked there too),
+  // speak the result, and remember it in the convo so the next turn knows.
+  if (d.act && d.act.action && s.callerPack && s.callerPack.owner === true) {
+    try {
+      const r = await postVoiceAct(s, d.act);
+      const said = r && r.ok ? String(r.result || 'Done.').replace(/[\u2714\u2716\u2717\u23f3\ud83d\udcc5\u260e]/g, '').trim().slice(0, 240) : ('That did not go through: ' + String((r && r.error) || 'no answer from the office').slice(0, 120));
+      sendText(s.ws, said, true);
+      s.convo.push({ role: 'assistant', content: '[ran ' + d.act.action + ': ' + said.slice(0, 200) + ']' });
+    } catch (e) { logErr('voiceact', e); sendText(s.ws, 'That action did not go through on my end.', true); }
+  } else if (d.act && !(s.callerPack && s.callerPack.owner === true)) {
+    logErr('voiceact.refused', 'act emitted on a non-owner call ' + s.callSid + ' — ignored');
+  }
   mergeLead(s.lead, d.lead);
   if (d.flagOwner) s.flag = true;
   if (d.commercial) s.commercial = true;
