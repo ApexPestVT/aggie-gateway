@@ -1,5 +1,6 @@
 // ============================================================================
-// AGGIE'S NEW TELEPHONE — Voice Gateway v1.2 (Twilio ConversationRelay <-> Anthropic)
+// AGGIE'S NEW TELEPHONE — Voice Gateway v1.12 (Twilio ConversationRelay <-> Anthropic)
+// v1.12: /health confesses the real version again (the constant had sat at 1.2 through v1.8–v1.11).
 // v1.2: outbound rescues ride this road too — customer number derived from
 // direction, call rows labeled correctly, and /health confesses its version.
 // Apex Pest Solutions · pairs with APS 2.0 v34.11+ (hook=brainpack / hook=relay / hook=voiceact since v1.9)
@@ -28,7 +29,7 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 
 // ---- config (all via environment; render.yaml wires these) -----------------
-const GW_VERSION = '1.7';
+const GW_VERSION = '1.12';
 const PORT       = process.env.PORT || 10000;
 const ANTHROPIC  = process.env.ANTHROPIC_API_KEY || '';
 const GAS_URL    = (process.env.GAS_EXEC_URL || '').replace(/\/+$/, ''); // full /exec URL, no query
@@ -328,6 +329,24 @@ async function handlePrompt(s, voicePrompt) {
         s.convo.push({ role: 'assistant', content: '[MISSION ABORTED \u2014 assignment brain never arrived; owner flagged to call back personally]' });
         sendText(s.ws, 'Sorry \u2014 I am having a technical moment on my end. Chris will give you a call back shortly. Thanks for picking up.', true);
         setTimeout(async () => { try { await twilioUpdateCall(s.callSid, '<Response><Hangup/></Response>'); } catch (e) { logErr('hangup', e); } }, 7000);
+        return;
+      }
+    } else if (genericPack && genericPack.owner && s.from && String(s.from).replace(/\D/g, '').slice(-10) === String(genericPack.owner).replace(/\D/g, '').slice(-10)) {
+      // v1.11 THE OWNER'S CALL IS NEVER THE RECEPTIONIST'S. The generic pack
+      // now carries the owner's number. His pack is cache-served (seconds),
+      // but if it still has not landed we wait — and if it truly cannot come we
+      // say so and hang up, rather than let the front desk tell the owner
+      // 'I can't see my own backend from here' (8/26).
+      try { await Promise.race([ s.packPromise, new Promise(res => setTimeout(res, 2500)) ]); } catch (e) {}
+      if (!s.callerPack) {
+        sendText(s.ws, 'One second, pulling everything up.', true);
+        try { await Promise.race([ s.packPromise, new Promise(res => setTimeout(res, 14000)) ]); } catch (e) {}
+      }
+      if (!s.callerPack) {
+        logErr('pack.owner', 'owner pack never landed for ' + s.callSid + ' — refusing to run the receptionist on the owner');
+        s.endWhy = 'owner brain missing';
+        sendText(s.ws, 'Chris, my assistant brain did not load on this call. Hang up and call me right back — it will be warm.', true);
+        setTimeout(async () => { try { await twilioUpdateCall(s.callSid, '<Response><Hangup/></Response>'); } catch (e) { logErr('hangup', e); } }, 6000);
         return;
       }
     } else {
