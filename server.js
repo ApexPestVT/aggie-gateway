@@ -331,7 +331,16 @@ async function handlePrompt(s, voicePrompt) {
         setTimeout(async () => { try { await twilioUpdateCall(s.callSid, '<Response><Hangup/></Response>'); } catch (e) { logErr('hangup', e); } }, 7000);
         return;
       }
-    } else if (genericPack && genericPack.owner && s.from && String(s.from).replace(/\D/g, '').slice(-10) === String(genericPack.owner).replace(/\D/g, '').slice(-10)) {
+    } else if (genericPack && (function(){
+    // v1.14 OWNER_LINES (the Kylie embarrassment): recognition checks the
+    // ALLOWLIST the pack now carries, not a single number. Any house line in,
+    // full owner mode. Falls back to the lone owner field on old packs.
+    if (!s.from) return false;
+    var d10 = String(s.from).replace(/\D/g, '').slice(-10);
+    var list = (genericPack.ownerLines && genericPack.ownerLines.length) ? genericPack.ownerLines
+             : (genericPack.owner ? [String(genericPack.owner).replace(/\D/g, '').slice(-10)] : []);
+    return list.indexOf(d10) >= 0;
+  })()) {
       // v1.11 THE OWNER'S CALL IS NEVER THE RECEPTIONIST'S. The generic pack
       // now carries the owner's number. His pack is cache-served (seconds),
       // but if it still has not landed we wait — and if it truly cannot come we
