@@ -435,6 +435,15 @@ async function handlePrompt(s, voicePrompt) {
   if (d.sched && d.sched.action) s.sched = d.sched;
 
   if (d.transfer) return doTransfer(s, 'caller asked');
+  // v1.12 HER MOUTH BINDS HER PLUMBING (owner, Sept 12: caller asked for a
+  // person, she said "One moment while I try Chris for you" — and the
+  // transfer flag never came, so the socket stayed open, the caller sat in
+  // silence and hung up; zero calls reached his phone, a $350 quote walked).
+  // If she TELLS the caller she is getting Chris, that IS the transfer,
+  // JSON flag or not — the words she speaks to a customer are commitments.
+  if (/\b(one moment|hold on|hang on|just a (second|moment|sec))?[^.]*\b(try|get|grab|connect you (?:to|with)|transfer(?:ring)? you to|put you through to)\s+(chris|him)\b/i.test(String(raw||''))) {
+    return doTransfer(s, 'spoken-intent');
+  }
   if (d.done) {
     s.done = true;
     s.endWhy = 'completed';
