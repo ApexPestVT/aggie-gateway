@@ -200,6 +200,16 @@ function parseTurn(raw) {
   return null;
 }
 
+// v1.15 ONE WOMAN, EVERY LINE (owner: "when a customer asks to speak with
+// me her voice changes" - the transfer's plain <Say> lines fell to Polly
+// while the conversation rode ElevenLabs). Fixed phrases now <Play> from the
+// memory server's /say voice cache; unset MEM_SAY_BASE falls back to <Say>.
+// MEM_SAY_BASE example: https://aggie-memory.onrender.com/say?key=THEKEY
+const MEM_SAY_BASE = process.env.MEM_SAY_BASE || '';
+function sayLine(text) {
+  if (MEM_SAY_BASE) return '<Play>' + xesc(MEM_SAY_BASE + '&text=' + encodeURIComponent(text)) + '</Play>';
+  return '<Say>' + xesc(text) + '</Say>';
+}
 // ---- Twilio REST helpers (transfer + graceful hangup, no GAS in the path) ---
 async function twilioUpdateCall(callSid, twiml) {
   const u = 'https://api.twilio.com/2010-04-01/Accounts/' + TW_SID + '/Calls/' + callSid + '.json';
@@ -490,12 +500,12 @@ async function doTransfer(s, why) {
   const recCb = GAS_URL + '?hook=rec&k=' + encodeURIComponent(WKEY) + '&vm=1';
   try {
     await twilioUpdateCall(s.callSid,
-      '<Response><Say>One moment while I connect you.</Say>' +
+      '<Response>' + sayLine('One moment while I connect you.') +
       // v1.7 GUARDED BACKUP (owner: 'guard it'): the bridged human leg records
       // too. GAS treats leg=xfer as SECONDARY \u2014 it can never overwrite the
       // call-level recording; it only steps in if that one never arrived.
       '<Dial timeout="20" callerId="+18028999491" answerOnBridge="true" record="record-from-answer" recordingStatusCallback="' + xesc(GAS_URL + '?hook=rec&k=' + encodeURIComponent(WKEY) + '&leg=xfer') + '">' + xesc(CHRIS_CELL) + '</Dial>' +
-      '<Say>Sorry, he could not grab the phone. Leave your name, number, and what you are seeing after the tone, and we will call you right back.</Say>' +
+      sayLine('Sorry, he could not grab the phone. Leave your name, number, and what you are seeing after the tone, and we will call you right back.') +
       '<Record maxLength="120" playBeep="true" recordingStatusCallback="' + xesc(recCb) + '"/>' +
       '<Say>Thanks. We will be in touch shortly.</Say><Hangup/></Response>');
   } catch (e) { logErr('transfer', e); }
