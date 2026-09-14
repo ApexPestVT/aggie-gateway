@@ -303,10 +303,41 @@ function sendText(ws, token, last) {
   try { ws.send(JSON.stringify({ type: 'text', token, last: !!last })); } catch (e) { logErr('ws.send', e); }
 }
 
+// v1.16 MAX'S EARS (SHADOW). He listens for an address in the caller's words;
+// on the first hit of the call he asks GAS's read-only slot door and - with
+// MAX_LIVE unset - LOGS what he would have handed her. MAX_LIVE=1 (the
+// introduction, owner-flipped only) makes the card land in her context as
+// [DISPATCH - Max]. He books nothing, speaks to no customer, ever.
+const MAX_LIVE = process.env.MAX_LIVE === '1';
+const MAX_ADDR_RE = /\b\d{1,5}\s+[A-Za-z][A-Za-z.\- ]{2,28}\s(?:st|street|rd|road|dr|drive|ln|lane|ave|avenue|hwy|highway|way|ct|court|cir|circle|ter|terrace|pl|place)\b/i;
+function maxListen(s, text) {
+  try {
+    if (s.maxDone || !text) return;
+    const m = MAX_ADDR_RE.exec(String(text));
+    if (!m) return;
+    s.maxDone = true;
+    const addr = m[0];
+    const u = GAS_URL + '?hook=maxslot&k=' + encodeURIComponent(WKEY);
+    const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), 8000);
+    fetch(u, { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ address: addr }), signal: ctl.signal })
+      .then(r => r.text()).then(txt => {
+        clearTimeout(tm);
+        let j = {}; try { j = JSON.parse(txt); } catch (e) {}
+        if (!j.ok || !j.slots || !j.slots.length) { logInfo('max: no slots for "' + addr + '"'); return; }
+        const card = '[DISPATCH \u2014 Max] Slots for ' + addr + ': ' + j.slots.join(' \u00b7 ');
+        if (!MAX_LIVE) { logInfo('MAX-SHADOW would hand: ' + card); return; }
+        if (!s.ws || s.ws.readyState !== 1) return;   // call ended - stale card dies
+        s.convo.push({ role: 'user', content: card });
+        logInfo('max: card handed on ' + s.callSid);
+      }).catch(() => { clearTimeout(tm); });
+  } catch (e) { logErr('maxListen', e); }
+}
 async function handlePrompt(s, voicePrompt) {
   // a new utterance always cancels a stale in-flight turn (barge-in via speech)
   if (s.ctl) { try { s.ctl.abort(); } catch (e) {} }
   s.convo.push({ role: 'user', content: String(voicePrompt).slice(0, 500) });
+  maxListen(s, voicePrompt);   // v1.16 shadow ears - logs only unless MAX_LIVE=1
 
   // v1.1 brain choice, EVERY turn: the caller-specific pack (their dossier
   // inside) wins the moment it lands — even mid-call. First turn races it
