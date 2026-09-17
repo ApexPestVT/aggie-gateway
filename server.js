@@ -1,5 +1,13 @@
 // ============================================================================
-// AGGIE'S NEW TELEPHONE — Voice Gateway v1.12 (Twilio ConversationRelay <-> Anthropic)
+// AGGIE'S NEW TELEPHONE — Voice Gateway v1.17 (Twilio ConversationRelay <-> Anthropic)
+// v1.18: + rescheduleJob on the customer line (voice can now move a visit the caller asked to move).
+// v1.17: THE CUSTOMER LINE GETS HANDS. Her JSON on a customer call may carry `act`
+//        (bookJob / cancelJob / noteJob / confirmJob); it rides to GAS hook=voicebook
+//        WHILE THE CALLER IS STILL ON THE LINE, and she speaks the `say` line GAS hands
+//        back — never an improvised confirmation. THE LAW OF THE SAME TURN: if her words
+//        promise a date, a cancel, or a note and the act is missing, the act is built from
+//        her lead + the caller's last words, and a fallback line is spoken on ok:false.
+//        Pairs with APS 2.0 v38.517+ (hook=voicebook) / v38.518 (the brain knows the act).
 // v1.12: /health confesses the real version again (the constant had sat at 1.2 through v1.8–v1.11).
 // v1.2: outbound rescues ride this road too — customer number derived from
 // direction, call rows labeled correctly, and /health confesses its version.
@@ -29,7 +37,7 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 
 // ---- config (all via environment; render.yaml wires these) -----------------
-const GW_VERSION = '1.12';
+const GW_VERSION = '1.18';
 const PORT       = process.env.PORT || 10000;
 const ANTHROPIC  = process.env.ANTHROPIC_API_KEY || '';
 const GAS_URL    = (process.env.GAS_EXEC_URL || '').replace(/\/+$/, ''); // full /exec URL, no query
@@ -46,6 +54,8 @@ const errs = [];
 // v1.7: the API reports cache reads on the opening event of each turn. Keeping
 // the last numbers means caching can be PROVEN on /health, not just believed.
 let lastUsage = null;
+// v1.17: the last few voicebook round-trips, so /health can prove her hands work.
+const acts = [];
 function logErr(where, e) {
   const line = new Date().toISOString() + ' ' + where + ': ' + String((e && e.message) || e);
   console.error(line);
@@ -127,12 +137,12 @@ async function aiTurn(sys, convo, onReplyText, signal) {
       'anthropic-version': '2023-06-01'
     },
     // v1.7 THE BRAIN WAS RE-SENT ON EVERY SINGLE TURN. Aggie's system prompt is
-    // the whole canon, the dossier, the availability \u2014 tens of thousands of
-    // tokens \u2014 and a ten-turn call paid for it ten times over. 87.7M tokens in a
+    // the whole canon, the dossier, the availability — tens of thousands of
+    // tokens — and a ten-turn call paid for it ten times over. 87.7M tokens in a
     // week is what pushed the account into its spend cap mid-morning and took
     // her brain offline. Marking it cacheable means the first turn of a call
     // pays full price and every turn after reads from cache at a tenth the
-    // cost. Same prompt, same behaviour, same voice \u2014 only the bill changes.
+    // cost. Same prompt, same behaviour, same voice — only the bill changes.
     body: JSON.stringify({
       model: MODEL, max_tokens: MAX_TOKENS,
       system: [{ type: 'text', text: sys, cache_control: { type: 'ephemeral' } }],
@@ -275,6 +285,52 @@ async function postVoiceAct(s, act) {
   } finally { clearTimeout(tm); }
 }
 
+// v1.17 THE CUSTOMER LINE'S HANDS (Aggie's own #1, Sept 16 — Pedro Tito: a time
+// promised on a live call with no work order behind it). One try, 8s: the caller
+// is on the line. GAS answers with a `say` line either way; on timeout the
+// fallback is spoken and the post-call sweep + the red row catch the rest.
+const CUSTOMER_ACTS = { bookJob: 1, cancelJob: 1, noteJob: 1, confirmJob: 1, rescheduleJob: 1 };   // v1.18: + reschedule
+const FALLBACK_SAY = 'I will have Chris confirm that with you shortly.';
+async function postVoiceBook(s, act) {
+  const u = GAS_URL + '?hook=voicebook&k=' + encodeURIComponent(WKEY);
+  const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), 8000);
+  const t0 = Date.now();
+  try {
+    const r = await fetch(u, { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ callSid: s.callSid, from: s.from, act }), redirect: 'follow', signal: ctl.signal });
+    const txt = await r.text();
+    let j; try { j = JSON.parse(txt); } catch (e) { j = { ok: false, error: 'unreadable: ' + txt.slice(0, 80), say: FALLBACK_SAY }; }
+    acts.push({ at: new Date().toISOString(), sid: s.callSid, action: act.action, ok: !!j.ok, ms: Date.now() - t0, woId: j.woId || '', error: j.error || '' });
+    while (acts.length > 12) acts.shift();
+    return j;
+  } catch (e) {
+    acts.push({ at: new Date().toISOString(), sid: s.callSid, action: act.action, ok: false, ms: Date.now() - t0, error: String((e && e.message) || e).slice(0, 80) });
+    while (acts.length > 12) acts.shift();
+    return { ok: false, error: String((e && e.message) || e).slice(0, 120), say: FALLBACK_SAY };
+  } finally { clearTimeout(tm); }
+}
+
+// v1.17 THE LAW OF THE SAME TURN (voice edition of GAS v38.512/514). If her
+// spoken reply commits to a date / a cancel / a note and the JSON carried no
+// act, build the act from what she already extracted (lead) plus the caller's
+// last words as the agreement quote. GAS still applies the evidence law — a
+// synthesized bookJob without a real "yes" in callerSaid books nothing and
+// hands back the honest line.
+const RX_SAID_BOOKED = /\b(you(?:'|’)?re (?:all )?set|on the books|got you (?:down|in) for|i(?:'|’)?ve got you (?:down|in)|(?:we(?:'|’)?ll|i(?:'|’)?ll) (?:be|see you) (?:there|out|then)|booked you|scheduled for|see you (?:on |then|at )?)\b/i;
+const RX_SAID_CANCEL = /\b((?:it(?:'|’)?s|that(?:'|’)?s|that one(?:'|’)?s|you(?:'|’)?re) (?:all )?(?:canceled|cancelled)|(?:i(?:'|’)?ve )?(?:canceled|cancelled) (?:it|that|your|the)|taken (?:it|that|you) off (?:the|our) (?:schedule|books|calendar)|off the schedule)\b/i;
+const RX_SAID_MOVED  = /\b(moved (?:you|it|that|your visit) to|you(?:'|’)?re (?:now )?(?:moved|rescheduled) (?:to|for)|rescheduled (?:you|it|that|your visit) (?:to|for)|new (?:day|date) is)\b/i;
+const RX_SAID_NOTED  = /\b(i(?:'|’)?ve noted|i noted|noted (?:on|for)|on (?:the|your) work ?order|tech (?:comes|will come|will be) prepared|i(?:'|’)?ll (?:make a note|note that)|added (?:it|that) to (?:this|your|the) visit)\b/i;
+function synthesizeAct(s, d) {
+  const reply = String((d && d.reply) || '');
+  const lastUser = (function () { for (let i = s.convo.length - 1; i >= 0; i--) { if (s.convo[i].role === 'user' && !/^\[/.test(String(s.convo[i].content || ''))) return String(s.convo[i].content || ''); } return ''; })();
+  const lead = Object.assign({}, s.lead || {}, (d && d.lead) || {});
+  if (RX_SAID_CANCEL.test(reply)) return { action: 'cancelJob', data: { name: lead.name || '', phone: s.from, promised: reply.slice(0, 240), callerSaid: lastUser.slice(0, 200) } };
+  if (RX_SAID_MOVED.test(reply) && (lead.day || lead.window)) return { action: 'rescheduleJob', data: { name: lead.name || '', phone: s.from, day: lead.day || '', window: lead.window || '', promised: reply.slice(0, 240), callerSaid: lastUser.slice(0, 200) } };
+  if (RX_SAID_NOTED.test(reply)) return { action: 'noteJob', data: { name: lead.name || '', phone: s.from, note: (reply.slice(0, 200) + (lastUser ? (' — caller said: “' + lastUser.slice(0, 120) + '”') : '')), promised: reply.slice(0, 240), callerSaid: lastUser.slice(0, 200) } };
+  if (RX_SAID_BOOKED.test(reply) && (lead.day || lead.window)) return { action: 'bookJob', data: { name: lead.name || '', phone: s.from, address: lead.address || '', service: lead.service || lead.pest || '', day: lead.day || '', window: lead.window || '', price: lead.price || '', promised: reply.slice(0, 240), callerSaid: lastUser.slice(0, 200) } };
+  return null;
+}
+
 // ---- per-call session -------------------------------------------------------
 const sessions = new Map();   // ws -> session
 let callsHandled = 0;
@@ -287,7 +343,8 @@ function newSession(ws) {
     flag: false, commercial: false, tierOffered: false, tierTaken: '',
     sched: null, done: false, finalized: false,
     packPromise: null, pack: null, callerPack: null, recStarted: false, mid: '', endWhy: '', needsCallback: false,
-    ctl: null                  // AbortController of the in-flight AI turn
+    ctl: null,                 // AbortController of the in-flight AI turn
+    actsRan: []                // v1.17: what her hands did on this call (rides to GAS in the results)
   };
 }
 
@@ -325,7 +382,7 @@ function maxListen(s, text) {
         clearTimeout(tm);
         let j = {}; try { j = JSON.parse(txt); } catch (e) {}
         if (!j.ok || !j.slots || !j.slots.length) { logInfo('max: no slots for "' + addr + '"'); return; }
-        const card = '[DISPATCH \u2014 Max] Slots for ' + addr + ': ' + j.slots.join(' \u00b7 ');
+        const card = '[DISPATCH — Max] Slots for ' + addr + ': ' + j.slots.join(' · ');
         if (!MAX_LIVE) { logInfo('MAX-SHADOW would hand: ' + card); return; }
         if (!s.ws || s.ws.readyState !== 1) return;   // call ended - stale card dies
         s.convo.push({ role: 'user', content: card });
@@ -349,7 +406,7 @@ async function handlePrompt(s, voicePrompt) {
   // with 'how can I help you today?' to a person we had just dialed. Now:
   //   mission  - the generic brain is never an option. Wait for the mission
   //              pack (filler after 2s), and if it truly cannot come, say so
-  //              honestly, flag the owner, and end \u2014 never impersonate the
+  //              honestly, flag the owner, and end — never impersonate the
   //              front desk on an outbound call.
   //   inbound  - wait 3s silently, then one filler line, then up to 6s more
   //              for the caller's dossier before falling to generic. A known
@@ -365,10 +422,10 @@ async function handlePrompt(s, voicePrompt) {
         try { await Promise.race([ s.packPromise, new Promise(res => setTimeout(res, 12000)) ]); } catch (e) {}
       }
       if (!s.callerPack) {
-        logErr('pack.mission', 'no mission pack for ' + s.callSid + ' (mid ' + s.mid + ') \u2014 refusing to run the receptionist on an outbound call');
+        logErr('pack.mission', 'no mission pack for ' + s.callSid + ' (mid ' + s.mid + ') — refusing to run the receptionist on an outbound call');
         s.flag = true; s.needsCallback = true; s.endWhy = 'mission brain missing';
-        s.convo.push({ role: 'assistant', content: '[MISSION ABORTED \u2014 assignment brain never arrived; owner flagged to call back personally]' });
-        sendText(s.ws, 'Sorry \u2014 I am having a technical moment on my end. Chris will give you a call back shortly. Thanks for picking up.', true);
+        s.convo.push({ role: 'assistant', content: '[MISSION ABORTED — assignment brain never arrived; owner flagged to call back personally]' });
+        sendText(s.ws, 'Sorry — I am having a technical moment on my end. Chris will give you a call back shortly. Thanks for picking up.', true);
         setTimeout(async () => { try { await twilioUpdateCall(s.callSid, '<Response><Hangup/></Response>'); } catch (e) { logErr('hangup', e); } }, 7000);
         return;
       }
@@ -404,7 +461,7 @@ async function handlePrompt(s, voicePrompt) {
       if (!s.callerPack && first) {
         sendText(s.ws, 'One second while I pull up your account.', true);
         try { await Promise.race([ s.packPromise, new Promise(res => setTimeout(res, 6000)) ]); } catch (e) {}
-        if (!s.callerPack) logErr('pack.late', 'caller pack still not landed after 9s for ' + s.callSid + ' \u2014 first turn runs generic');
+        if (!s.callerPack) logErr('pack.late', 'caller pack still not landed after 9s for ' + s.callSid + ' — first turn runs generic');
       }
     }
   }
@@ -449,11 +506,13 @@ async function handlePrompt(s, voicePrompt) {
   else sendText(s.ws, '', true);               // close the utterance
 
   s.convo.push({ role: 'assistant', content: String(d.reply).slice(0, 500) });
+  mergeLead(s.lead, d.lead);   // v1.17: merge BEFORE the hands, so a synthesized act sees this turn's extraction
+  const isOwner = !!(s.callerPack && s.callerPack.owner === true);
   // v1.9 THE OWNER LINE. When the pack said owner:true, the brain is AGI and a
   // turn may carry `act` — a chat-bubble action the owner just approved out
   // loud. Post it to GAS (hook=voiceact, owner-number checked there too),
   // speak the result, and remember it in the convo so the next turn knows.
-  if (d.act && d.act.action && s.callerPack && s.callerPack.owner === true) {
+  if (d.act && d.act.action && isOwner) {
     try {
       const r = await postVoiceAct(s, d.act);
       // v1.10 A LOOKUP IS A THOUGHT, NOT A LINE. The record goes back into the
@@ -474,10 +533,33 @@ async function handlePrompt(s, voicePrompt) {
       sendText(s.ws, said, true);
       s.convo.push({ role: 'assistant', content: '[ran ' + d.act.action + ': ' + said.slice(0, 200) + ']' });
     } catch (e) { logErr('voiceact', e); sendText(s.ws, 'That action did not go through on my end.', true); }
-  } else if (d.act && !(s.callerPack && s.callerPack.owner === true)) {
-    logErr('voiceact.refused', 'act emitted on a non-owner call ' + s.callSid + ' — ignored');
+  } else if (!isOwner && !s.mid) {
+    // v1.17 THE CUSTOMER LINE'S HANDS. Her act, or the one her words imply,
+    // rides to GAS while the caller is still on the line. Whatever GAS hands
+    // back as `say` is what she says next — a real confirmation on ok, the
+    // honest fallback on anything else. Missions keep their own script.
+    let act = (d.act && d.act.action && CUSTOMER_ACTS[d.act.action]) ? d.act : null;
+    let synthesized = false;
+    if (!act) { act = synthesizeAct(s, d); synthesized = !!act; }
+    if (d.act && d.act.action && !CUSTOMER_ACTS[d.act.action]) logErr('voicebook.refused', 'non-customer act ' + d.act.action + ' on ' + s.callSid + ' — ignored');
+    if (act) {
+      act.data = act.data || {};
+      act.data.phone = act.data.phone || s.from;
+      act.data.promised = act.data.promised || String(d.reply).slice(0, 240);
+      if (!act.data.callerSaid) { for (let i = s.convo.length - 1; i >= 0; i--) { if (s.convo[i].role === 'user' && !/^\[/.test(String(s.convo[i].content || ''))) { act.data.callerSaid = String(s.convo[i].content || '').slice(0, 200); break; } } }
+      try {
+        const r = await postVoiceBook(s, act);
+        const line = String((r && r.say) || FALLBACK_SAY).slice(0, 240);
+        const ok = !!(r && r.ok);
+        s.actsRan.push({ action: act.action, ok, woId: (r && r.woId) || '', synthesized, error: (r && r.error) || '' });
+        // ok: only speak the office's line when her own reply did not already say it (avoid "You're set. You're on the books.")
+        // not ok: ALWAYS speak the fallback — her words promised something the record could not hold.
+        if (!ok || synthesized) sendText(s.ws, line, true);
+        s.convo.push({ role: 'assistant', content: '[' + (ok ? 'ran ' : 'FAILED ') + act.action + (synthesized ? ' (from my own words)' : '') + ': ' + (ok ? line : String((r && r.error) || 'no answer')).slice(0, 200) + ']' });
+        logInfo('voicebook ' + act.action + (synthesized ? ' (synth)' : '') + ' ' + (ok ? 'ok ' + ((r && r.woId) || '') : 'FAIL ' + ((r && r.error) || '')) + ' on ' + s.callSid);
+      } catch (e) { logErr('voicebook', e); sendText(s.ws, FALLBACK_SAY, true); }
+    }
   }
-  mergeLead(s.lead, d.lead);
   if (d.flagOwner) s.flag = true;
   if (d.commercial) s.commercial = true;
   if (d.tierOffered) s.tierOffered = true;
@@ -533,7 +615,7 @@ async function doTransfer(s, why) {
     await twilioUpdateCall(s.callSid,
       '<Response>' + sayLine('One moment while I connect you.') +
       // v1.7 GUARDED BACKUP (owner: 'guard it'): the bridged human leg records
-      // too. GAS treats leg=xfer as SECONDARY \u2014 it can never overwrite the
+      // too. GAS treats leg=xfer as SECONDARY — it can never overwrite the
       // call-level recording; it only steps in if that one never arrived.
       '<Dial timeout="20" callerId="+18028999491" answerOnBridge="true" record="record-from-answer" recordingStatusCallback="' + xesc(GAS_URL + '?hook=rec&k=' + encodeURIComponent(WKEY) + '&leg=xfer') + '">' + xesc(CHRIS_CELL) + '</Dial>' +
       sayLine('Sorry, he could not grab the phone. Leave your name, number, and what you are seeing after the tone, and we will call you right back.') +
@@ -553,14 +635,15 @@ function finalize(s) {
     ts: new Date(s.startedAt).toISOString(),
     // v1.6 THE FIRST HALF OF THE CALL WAS BEING THROWN AWAY. A 24-turn cap
     // meant any conversation longer than a dozen exchanges arrived in APS with
-    // its opening missing \u2014 the pest, the town, the address, all the parts that
-    // matter most \u2014 and the thread appeared to start in the middle of nowhere.
+    // its opening missing — the pest, the town, the address, all the parts that
+    // matter most — and the thread appeared to start in the middle of nowhere.
     convo: s.convo.slice(-80),
     lead: hasLead ? s.lead : null,
     flag: s.flag || s.needsCallback, commercial: s.commercial, needsCallback: !!s.needsCallback,
     tierOffered: s.tierOffered, tierTaken: s.tierTaken,
     sched: s.sched, secs,
     needsSlot: !!(s.done && hasLead && !s.lead.window),
+    actsRan: s.actsRan,   // v1.17: what her hands did on this call — the post-call sweep can skip what is already written
     done: s.done
   }).catch(e => logErr('finalize', e));
 }
@@ -575,6 +658,7 @@ const server = http.createServer((req, res) => {
       brainVersion: genericPack ? genericPack.v : null,
       model: MODEL, callsHandled, liveCalls: sessions.size,
       promptCache: lastUsage || 'no turns yet since restart',
+      hands: acts.slice(-8),   // v1.17: the last voicebook round-trips — proof her hands work, or exactly why not
       recentErrors: errs.slice(-8)
     }, null, 2));
     return;
