@@ -1,5 +1,6 @@
 // ============================================================================
 // AGGIE'S NEW TELEPHONE — Voice Gateway v1.17 (Twilio ConversationRelay <-> Anthropic)
+// v1.19: acts inherit the call's extracted lead (name/address/email/service) when the act left them blank.
 // v1.18: + rescheduleJob on the customer line (voice can now move a visit the caller asked to move).
 // v1.17: THE CUSTOMER LINE GETS HANDS. Her JSON on a customer call may carry `act`
 //        (bookJob / cancelJob / noteJob / confirmJob); it rides to GAS hook=voicebook
@@ -37,7 +38,7 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 
 // ---- config (all via environment; render.yaml wires these) -----------------
-const GW_VERSION = '1.18';
+const GW_VERSION = '1.19';
 const PORT       = process.env.PORT || 10000;
 const ANTHROPIC  = process.env.ANTHROPIC_API_KEY || '';
 const GAS_URL    = (process.env.GAS_EXEC_URL || '').replace(/\/+$/, ''); // full /exec URL, no query
@@ -545,6 +546,9 @@ async function handlePrompt(s, voicePrompt) {
     if (act) {
       act.data = act.data || {};
       act.data.phone = act.data.phone || s.from;
+      // v1.19 THE ACT INHERITS THE LEAD (owner's test call booked a job with no name -> no customer, no lead):
+      // whatever she already extracted across the call rides with the act when the act itself left it blank.
+      try { const L = s.lead || {}; ['name','address','email','service','pest','day','window'].forEach(k => { if (!act.data[k] && L[k]) act.data[k] = L[k]; }); if (!act.data.service && act.data.pest) act.data.service = act.data.pest; } catch (e) {}
       act.data.promised = act.data.promised || String(d.reply).slice(0, 240);
       if (!act.data.callerSaid) { for (let i = s.convo.length - 1; i >= 0; i--) { if (s.convo[i].role === 'user' && !/^\[/.test(String(s.convo[i].content || ''))) { act.data.callerSaid = String(s.convo[i].content || '').slice(0, 200); break; } } }
       try {
