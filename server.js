@@ -1,5 +1,8 @@
 // ============================================================================
 // AGGIE'S NEW TELEPHONE — Voice Gateway v1.17 (Twilio ConversationRelay <-> Anthropic)
+// v1.22: per-turn clock in /health (caller-done → first word, interrupts, silent turns).
+// v1.21: the first-turn holding line is neutral unless the pack says the caller is a known customer.
+// v1.20: one booking per call - recaps never re-book; recap answers are silent.
 // v1.19: acts inherit the call's extracted lead (name/address/email/service) when the act left them blank.
 // v1.18: + rescheduleJob on the customer line (voice can now move a visit the caller asked to move).
 // v1.17: THE CUSTOMER LINE GETS HANDS. Her JSON on a customer call may carry `act`
@@ -38,7 +41,7 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 
 // ---- config (all via environment; render.yaml wires these) -----------------
-const GW_VERSION = '1.19';
+const GW_VERSION = '1.22';
 const PORT       = process.env.PORT || 10000;
 const ANTHROPIC  = process.env.ANTHROPIC_API_KEY || '';
 const GAS_URL    = (process.env.GAS_EXEC_URL || '').replace(/\/+$/, ''); // full /exec URL, no query
@@ -357,8 +360,18 @@ function mergeLead(into, from) {
   }
 }
 
+// v1.22 THE TURN CLOCK (Aggie's sticky note, Sept 17 5:25 PM: 'tangled in the echo/delay', 'the double Hello? means they
+// couldn't hear me'). Twilio owns the ears and the voice; the gateway owns the gap between the caller finishing and her
+// first word. Every turn records: caller-done → first token (ms), → last token (ms), tokens sent, and interrupts
+// (caller talked over her). /health shows the last 30. First-token > 2000ms is the lag she feels; a turn with 0 tokens
+// is a silent turn; a call full of interrupts is a caller hearing her late.
+const turns = [];
 function sendText(ws, token, last) {
-  try { ws.send(JSON.stringify({ type: 'text', token, last: !!last })); } catch (e) { logErr('ws.send', e); }
+  try {
+    if (ws && ws._turnT0) { const now = Date.now(); if (!ws._turnFirst) ws._turnFirst = now - ws._turnT0; ws._turnTokens = (ws._turnTokens || 0) + 1;
+      if (last) { turns.push({ at: new Date().toISOString(), call: ws._callSid || '', firstMs: ws._turnFirst, doneMs: now - ws._turnT0, tokens: ws._turnTokens, interrupts: ws._turnInterrupts || 0, words: String(token || '').split(/\s+/).length }); if (turns.length > 30) turns.shift(); ws._turnT0 = 0; ws._turnFirst = 0; ws._turnTokens = 0; ws._turnInterrupts = 0; } }
+    ws.send(JSON.stringify({ type: 'text', token, last: !!last }));
+  } catch (e) { logErr('ws.send', e); }
 }
 
 // v1.16 MAX'S EARS (SHADOW). He listens for an address in the caller's words;
@@ -447,7 +460,7 @@ async function handlePrompt(s, voicePrompt) {
       // 'I can't see my own backend from here' (8/26).
       try { await Promise.race([ s.packPromise, new Promise(res => setTimeout(res, 2500)) ]); } catch (e) {}
       if (!s.callerPack) {
-        sendText(s.ws, 'One second, pulling everything up.', true);
+        sendText(s.ws, 'One second, pulling everything up.', true);   // owner line: he always has an account
         try { await Promise.race([ s.packPromise, new Promise(res => setTimeout(res, 14000)) ]); } catch (e) {}
       }
       if (!s.callerPack) {
@@ -460,7 +473,9 @@ async function handlePrompt(s, voicePrompt) {
     } else {
       try { await Promise.race([ s.packPromise, new Promise(res => setTimeout(res, first ? 3000 : 800)) ]); } catch (e) {}
       if (!s.callerPack && first) {
-        sendText(s.ws, 'One second while I pull up your account.', true);
+        // v1.21 THE REFLEX MUST NOT ASSUME AN ACCOUNT (Aggie's journal, Sept 17: said 'pull up your account' to a
+        // salesperson who never had one). The pack is not here yet at this point, so the line is neutral unless it is.
+        sendText(s.ws, (s.callerPack && s.callerPack.known) ? 'One second while I pull up your account.' : 'One second — bear with me.', true);
         try { await Promise.race([ s.packPromise, new Promise(res => setTimeout(res, 6000)) ]); } catch (e) {}
         if (!s.callerPack) logErr('pack.late', 'caller pack still not landed after 9s for ' + s.callSid + ' — first turn runs generic');
       }
@@ -542,6 +557,9 @@ async function handlePrompt(s, voicePrompt) {
     let act = (d.act && d.act.action && CUSTOMER_ACTS[d.act.action]) ? d.act : null;
     let synthesized = false;
     if (!act) { act = synthesizeAct(s, d); synthesized = !!act; }
+    // v1.20 ONE BOOKING PER CALL: once a bookJob landed, her recaps do not re-book (the second act failed the
+    // evidence gate on 'thanks' and spoke 'Chris will confirm' after a perfectly good booking).
+    if (act && synthesized && act.action === 'bookJob' && s.actsRan.some(a => a.action === 'bookJob' && a.ok)) act = null;
     if (d.act && d.act.action && !CUSTOMER_ACTS[d.act.action]) logErr('voicebook.refused', 'non-customer act ' + d.act.action + ' on ' + s.callSid + ' — ignored');
     if (act) {
       act.data = act.data || {};
@@ -558,7 +576,7 @@ async function handlePrompt(s, voicePrompt) {
         s.actsRan.push({ action: act.action, ok, woId: (r && r.woId) || '', synthesized, error: (r && r.error) || '' });
         // ok: only speak the office's line when her own reply did not already say it (avoid "You're set. You're on the books.")
         // not ok: ALWAYS speak the fallback — her words promised something the record could not hold.
-        if (!ok || synthesized) sendText(s.ws, line, true);
+        if ((!ok || synthesized) && line && !(r && r.recap)) sendText(s.ws, line, true);   // v1.20: a recap answer carries no line to speak
         s.convo.push({ role: 'assistant', content: '[' + (ok ? 'ran ' : 'FAILED ') + act.action + (synthesized ? ' (from my own words)' : '') + ': ' + (ok ? line : String((r && r.error) || 'no answer')).slice(0, 200) + ']' });
         logInfo('voicebook ' + act.action + (synthesized ? ' (synth)' : '') + ' ' + (ok ? 'ok ' + ((r && r.woId) || '') : 'FAIL ' + ((r && r.error) || '')) + ' on ' + s.callSid);
       } catch (e) { logErr('voicebook', e); sendText(s.ws, FALLBACK_SAY, true); }
@@ -663,6 +681,7 @@ const server = http.createServer((req, res) => {
       model: MODEL, callsHandled, liveCalls: sessions.size,
       promptCache: lastUsage || 'no turns yet since restart',
       hands: acts.slice(-8),   // v1.17: the last voicebook round-trips — proof her hands work, or exactly why not
+      turns: turns.slice(-30), turnLag: (function(){ const f = turns.map(t => t.firstMs).filter(x => x > 0); if (!f.length) return null; f.sort((a,b)=>a-b); return { n: f.length, p50: f[Math.floor(f.length/2)], p90: f[Math.floor(f.length*0.9)], max: f[f.length-1], interrupts: turns.reduce((a,t)=>a+(t.interrupts||0),0), silentTurns: turns.filter(t=>!t.tokens).length }; })(),   // v1.22: the lag she feels, in numbers
       recentErrors: errs.slice(-8)
     }, null, 2));
     return;
@@ -710,9 +729,11 @@ wss.on('connection', (ws, mid) => {
       startRecording(s);   // v1.1: every live call is recorded, like v23.5 days
     }
     else if (m.type === 'prompt' && m.voicePrompt) {
+      try { s.ws._turnT0 = Date.now(); s.ws._turnFirst = 0; s.ws._turnTokens = 0; s.ws._callSid = s.callSid || ''; } catch (e) {}   // v1.22 turn clock starts when the caller finishes
       handlePrompt(s, m.voicePrompt).catch(e => logErr('handlePrompt', e));
     }
     else if (m.type === 'interrupt') {
+      try { s.ws._turnInterrupts = (s.ws._turnInterrupts || 0) + 1; } catch (e) {}   // v1.22
       if (s.ctl) { try { s.ctl.abort(); } catch (e) {} }
     }
     else if (m.type === 'error') {
