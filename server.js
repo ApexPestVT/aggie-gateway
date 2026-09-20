@@ -1,5 +1,9 @@
 // ============================================================================
 // AGGIE'S NEW TELEPHONE — Voice Gateway v1.17 (Twilio ConversationRelay <-> Anthropic)
+// v1.23: EVERY READ IS A THOUGHT, NOT A LINE (owner, Sept 18: 'if I ask how many rat jobs I want a number' / 'I especially
+//        don't like it when she repeats verbatim records on the phone'). Search/lookup/memory results go back to her as a
+//        private note (up to 6,000 chars, was 900 for lookup and a 240-char READ-ALOUD for every other search) and she
+//        ANSWERS from it; one chained read allowed; the note shrinks once answered so later turns stay fast.
 // v1.22: per-turn clock in /health (caller-done → first word, interrupts, silent turns).
 // v1.21: the first-turn holding line is neutral unless the pack says the caller is a known customer.
 // v1.20: one booking per call - recaps never re-book; recap answers are silent.
@@ -41,7 +45,7 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 
 // ---- config (all via environment; render.yaml wires these) -----------------
-const GW_VERSION = '1.22';
+const GW_VERSION = '1.23';
 const PORT       = process.env.PORT || 10000;
 const ANTHROPIC  = process.env.ANTHROPIC_API_KEY || '';
 const GAS_URL    = (process.env.GAS_EXEC_URL || '').replace(/\/+$/, ''); // full /exec URL, no query
@@ -293,6 +297,9 @@ async function postVoiceAct(s, act) {
 // promised on a live call with no work order behind it). One try, 8s: the caller
 // is on the line. GAS answers with a `say` line either way; on timeout the
 // fallback is spoken and the post-call sweep + the red row catch the rest.
+// v1.23 the reads: their results come back to HER, never read to the owner raw
+const READ_ACTS = { lookup:1, searchMemory:1, searchClients:1, searchJobs:1, searchInbox:1, readThread:1, lookupClient:1, lookupJob:1,
+  mindReport:1, recallMemory:1, explainMemory:1, intentions:1, leadsRecent:1, salesBacklog:1, auditLeads:1, auditWon:1, previewPurge:1, cacheReport:1, callQueue:1 };
 const CUSTOMER_ACTS = { bookJob: 1, cancelJob: 1, noteJob: 1, confirmJob: 1, rescheduleJob: 1 };   // v1.18: + reschedule
 const FALLBACK_SAY = 'I will have Chris confirm that with you shortly.';
 async function postVoiceBook(s, act) {
@@ -531,18 +538,33 @@ async function handlePrompt(s, voicePrompt) {
   if (d.act && d.act.action && isOwner) {
     try {
       const r = await postVoiceAct(s, d.act);
-      // v1.10 A LOOKUP IS A THOUGHT, NOT A LINE. The record goes back into the
-      // conversation as a note and she takes another turn with it in hand —
-      // the owner hears the answer, never the raw dump.
-      if (d.act.action === 'lookup') {
-        const note = '[LOOKUP RESULT] ' + String((r && r.result) || (r && r.error) || 'no answer').slice(0, 900);
-        s.convo.push({ role: 'user', content: note });
-        const sys2 = sys;
-        let raw2 = '';
-        try { raw2 = await aiTurn(sys2, s.convo, tok => sendText(s.ws, tok, false), null); } catch (e) { logErr('lookupTurn', e); }
-        const d2 = parseTurn(raw2);
-        if (d2 && d2.reply) { sendText(s.ws, '', true); s.convo.push({ role: 'assistant', content: String(d2.reply).slice(0, 500) }); }
-        else sendText(s.ws, 'Here is what I have: ' + note.replace(/^\[LOOKUP RESULT\] /, '').slice(0, 240), true);
+      // v1.10 A LOOKUP IS A THOUGHT, NOT A LINE. v1.23: so is EVERY read. The result goes back into the
+      // conversation as a note; she takes another turn with it in hand and ANSWERS — the owner hears the
+      // answer, never the rows. One chained read (search -> lookup) is allowed.
+      if (READ_ACTS[d.act.action]) {
+        let rr = r, act = d.act, depth = 0, d2 = null, spoke2 = false;
+        for (;;) {
+          const body = String((rr && (rr.result || rr.error)) || 'no answer');
+          const note = '[RESULT of ' + act.action + ' — FOR YOU, NOT TO READ ALOUD. Answer his question from it in one or two spoken sentences: '
+            + 'a count is a number ("fourteen"), a yes/no is yes or no plus the one fact that proves it, a who/when is the name or the day. '
+            + 'Never read rows, lists, ids, phone numbers, timestamps or quoted text unless he asks you to read it. If it does not answer him, say so plainly.]\n'
+            + body.slice(0, 6000);
+          s.convo.push({ role: 'user', content: note });
+          let raw2 = '';
+          spoke2 = false;
+          try { raw2 = await aiTurn(sys, s.convo, tok => { spoke2 = true; sendText(s.ws, tok, false); }, null); } catch (e) { logErr('readTurn', e); }
+          d2 = parseTurn(raw2);
+          s.convo[s.convo.length - 1].content = note.slice(0, 1500);   /* answered: keep the gist, not 6k of rows, for later turns */
+          if (d2 && d2.act && d2.act.action && READ_ACTS[d2.act.action] && depth < 1) {
+            depth++; act = d2.act;
+            if (d2.reply) { sendText(s.ws, '', true); s.convo.push({ role: 'assistant', content: String(d2.reply).slice(0, 500) }); }
+            try { rr = await postVoiceAct(s, act); } catch (e) { logErr('voiceact.chain', e); rr = { ok: false, error: 'the office did not answer' }; }
+            continue;
+          }
+          break;
+        }
+        if (d2 && d2.reply) { sendText(s.ws, spoke2 ? '' : String(d2.reply), true); s.convo.push({ role: 'assistant', content: String(d2.reply).slice(0, 500) }); }   /* extractor missed (plain text) - speak the parsed reply, as the main path does */
+        else sendText(s.ws, 'I pulled it up but lost my train of thought — ask me that once more?', true);
         return;
       }
       const said = r && r.ok ? String(r.result || 'Done.').replace(/[\u2714\u2716\u2717\u23f3\ud83d\udcc5\u260e]/g, '').trim().slice(0, 240) : ('That did not go through: ' + String((r && r.error) || 'no answer from the office').slice(0, 120));
