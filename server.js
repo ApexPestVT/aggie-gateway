@@ -1,5 +1,9 @@
 // ============================================================================
 // AGGIE'S NEW TELEPHONE — Voice Gateway v1.17 (Twilio ConversationRelay <-> Anthropic)
+// v1.27: SAY IT, DO IT on the live call — the same commitment vocabulary as the kit's text/email lanes (v38.639): 'passed this
+//        to the tech', 'the tech will be out', 'someone will be there this afternoon', 'on the board/schedule for' now bind a
+//        booking the same as 'you're all set', so a visit she describes on a call cannot leave the call without a work order
+//        (or the honest fallback line). Owner request Sept 21: 'on any communication with a client, she says it, she does it.'
 // v1.26: LIVE PICTURE ON A CALL (owner: 'hey meta call aggie, with live picture sending'). Mid-call, when Chris
 //        references a photo he just sent ('what is this', 'look at this', 'I sent you'), the gateway pulls the
 //        pending MMS from GAS (hook=glasspending), fetches it from Twilio, and shows it to her in that turn. Owner only.
@@ -58,7 +62,7 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 
 // ---- config (all via environment; render.yaml wires these) -----------------
-const GW_VERSION = '1.26';
+const GW_VERSION = '1.27';
 const PORT       = process.env.PORT || 10000;
 const ANTHROPIC  = process.env.ANTHROPIC_API_KEY || '';
 const GAS_URL    = (process.env.GAS_EXEC_URL || '').replace(/\/+$/, ''); // full /exec URL, no query
@@ -355,7 +359,7 @@ async function postVoiceBook(s, act) {
 // last words as the agreement quote. GAS still applies the evidence law — a
 // synthesized bookJob without a real "yes" in callerSaid books nothing and
 // hands back the honest line.
-const RX_SAID_BOOKED = /\b(you(?:'|’)?re (?:all )?set|on the books|got you (?:down|in) for|i(?:'|’)?ve got you (?:down|in)|(?:we(?:'|’)?ll|i(?:'|’)?ll) (?:be|see you) (?:there|out|then)|booked you|scheduled for|see you (?:on |then|at )?)\b/i;
+const RX_SAID_BOOKED = /\b((?:you(?:'|’)?re|you are) (?:all )?set|on the (?:books|board|schedule)(?: for)?|got you (?:down|in) for|i(?:'|’)?ve got you (?:down|in)|(?:we(?:'|’)?ll|i(?:'|’)?ll) (?:be|see you) (?:there|out|then)|booked you|scheduled for|see you (?:on |then|at )?|passed (?:this|it|that)?\s*(?:straight |along )?to (?:the )?tech|the tech will (?:be (?:out|there)|come|stop by|handle)|(?:someone|a tech) will be (?:out|there)|put you (?:down|on the (?:books|board|schedule)))\b/i;   // v1.27: + the kit's shared commitment vocabulary
 const RX_SAID_CANCEL = /\b((?:it(?:'|’)?s|that(?:'|’)?s|that one(?:'|’)?s|you(?:'|’)?re) (?:all )?(?:canceled|cancelled)|(?:i(?:'|’)?ve )?(?:canceled|cancelled) (?:it|that|your|the)|taken (?:it|that|you) off (?:the|our) (?:schedule|books|calendar)|off the schedule)\b/i;
 const RX_SAID_MOVED  = /\b(moved (?:you|it|that|your visit) to|you(?:'|’)?re (?:now )?(?:moved|rescheduled) (?:to|for)|rescheduled (?:you|it|that|your visit) (?:to|for)|new (?:day|date) is)\b/i;
 const RX_SAID_NOTED  = /\b(i(?:'|’)?ve noted|i noted|noted (?:on|for)|on (?:the|your) work ?order|tech (?:comes|will come|will be) prepared|i(?:'|’)?ll (?:make a note|note that)|added (?:it|that) to (?:this|your|the) visit)\b/i;
