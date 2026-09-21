@@ -1,5 +1,18 @@
 // ============================================================================
 // AGGIE'S NEW TELEPHONE — Voice Gateway v1.17 (Twilio ConversationRelay <-> Anthropic)
+// v1.26: LIVE PICTURE ON A CALL (owner: 'hey meta call aggie, with live picture sending'). Mid-call, when Chris
+//        references a photo he just sent ('what is this', 'look at this', 'I sent you'), the gateway pulls the
+//        pending MMS from GAS (hook=glasspending), fetches it from Twilio, and shows it to her in that turn. Owner only.
+// v1.25: the temple tap sends the frame from the instant before the tap (auto:true) - she uses it only when the
+//        question is about something he can see; a plain question with a tap photo is answered as a plain question.
+// v1.24: THE GLASSES DOOR (owner, Sept 21: 'same voice as phone' + 'about 1 minute to answer the simplest questions').
+//        POST /glass?k=WEBHOOK_KEY {q, img?, mt?} -> {ok, say, audio (base64 mp3 in her phone voice)}. The Aggie Eyes app
+//        on his Ray-Ban Metas now rides this warm server like his phone calls do: GAS compiles the glasses brain
+//        (hook=brainpack&glass=1), held here and refreshed in the background while the glasses are in use; photo +
+//        question go to Claude in ONE streamed call; reads chain once like the phone; record changes ride hook=voiceact
+//        with glass:true + his words, and GAS refuses them without the code. Voice: ElevenLabs with the phone line's
+//        own voice id (needs ELEVENLABS_API_KEY here) -> else the memory server's /say voice -> else none (app speaks).
+//        GET /glass/warm (app start) · GET /glass/say?text= (short fixed lines) · /health shows glass timings.
 // v1.23: EVERY READ IS A THOUGHT, NOT A LINE (owner, Sept 18: 'if I ask how many rat jobs I want a number' / 'I especially
 //        don't like it when she repeats verbatim records on the phone'). Search/lookup/memory results go back to her as a
 //        private note (up to 6,000 chars, was 900 for lookup and a 240-char READ-ALOUD for every other search) and she
@@ -45,7 +58,7 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 
 // ---- config (all via environment; render.yaml wires these) -----------------
-const GW_VERSION = '1.23';
+const GW_VERSION = '1.26';
 const PORT       = process.env.PORT || 10000;
 const ANTHROPIC  = process.env.ANTHROPIC_API_KEY || '';
 const GAS_URL    = (process.env.GAS_EXEC_URL || '').replace(/\/+$/, ''); // full /exec URL, no query
@@ -135,7 +148,22 @@ function replyExtractor(emit) {
   };
 }
 
-async function aiTurn(sys, convo, onReplyText, signal) {
+async function aiTurn(sys, convo, onReplyText, signal, image) {
+  let messages = convo;
+  if (image && image.b64) {
+    // v1.26: fold the photo into the LAST user turn so she sees what he sent, this turn only
+    messages = convo.slice();
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === 'user') {
+        const t = typeof messages[i].content === 'string' ? messages[i].content : '(look at this)';
+        messages[i] = { role: 'user', content: [
+          { type: 'image', source: { type: 'base64', media_type: image.mt || 'image/jpeg', data: image.b64 } },
+          { type: 'text', text: t + '\n(Chris just sent you this photo on the call — it is what he is looking at. Answer about it in one or two spoken sentences.)' }
+        ] };
+        break;
+      }
+    }
+  }
   const r = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     signal,
@@ -154,7 +182,7 @@ async function aiTurn(sys, convo, onReplyText, signal) {
     body: JSON.stringify({
       model: MODEL, max_tokens: MAX_TOKENS,
       system: [{ type: 'text', text: sys, cache_control: { type: 'ephemeral' } }],
-      messages: convo, stream: true
+      messages, stream: true
     })
   });
   if (!r.ok) throw new Error('anthropic ' + r.status + ': ' + (await r.text()).slice(0, 200));
@@ -287,7 +315,7 @@ async function postVoiceAct(s, act) {
   const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), 20000);
   try {
     const r = await fetch(u, { method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ sid: s.callSid, from: s.from, act }), redirect: 'follow', signal: ctl.signal });
+      body: JSON.stringify(s.glass ? { sid: s.callSid, from: s.from, act, glass: true, said: String(s.said || '') } : { sid: s.callSid, from: s.from, act }), redirect: 'follow', signal: ctl.signal });
     const txt = await r.text();
     try { return JSON.parse(txt); } catch (e) { return { ok: false, error: 'unreadable: ' + txt.slice(0, 80) }; }
   } finally { clearTimeout(tm); }
@@ -411,6 +439,45 @@ function maxListen(s, text) {
       }).catch(() => { clearTimeout(tm); });
   } catch (e) { logErr('maxListen', e); }
 }
+// ---- v1.26 live picture on a call ------------------------------------------
+const IMG_REF = /\b(look(ing)? at|see (this|that|it)|what(?:'|’)?s (this|that|it)|what is (this|that|it)|what am i (looking at|seeing)|i (just )?(sent|texted|sending|shot)|check (this|that|it) out|this (photo|picture|pic|bug|thing|one)|the (photo|picture|pic) i|show(ing)? (you|ya))\b/i;
+async function pendingPhotoUrl(phone) {
+  try {
+    const u = GAS_URL + '?hook=glasspending&k=' + encodeURIComponent(WKEY) + '&phone=' + encodeURIComponent(phone || '');
+    const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), 8000);
+    try {
+      const r = await fetch(u, { method: 'POST', redirect: 'follow', signal: ctl.signal });
+      const j = await r.json();
+      return (j && j.has && j.url) ? String(j.url) : '';
+    } finally { clearTimeout(tm); }
+  } catch (e) { logErr('glass.pending', e); return ''; }
+}
+async function fetchTwilioMedia(url) {
+  if (!TW_SID || !TW_TOKEN) return null;
+  const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), 12000);
+  try {
+    const r = await fetch(url, { headers: { authorization: 'Basic ' + Buffer.from(TW_SID + ':' + TW_TOKEN).toString('base64') }, redirect: 'follow', signal: ctl.signal });
+    if (!r.ok) { logErr('glass.media', 'twilio media ' + r.status); return null; }
+    const mt = (r.headers.get('content-type') || 'image/jpeg').split(';')[0];
+    if (!/^image\//.test(mt)) return null;
+    const buf = Buffer.from(await r.arrayBuffer());
+    if (buf.length > 4800000) { logErr('glass.media', 'photo too big ' + buf.length); return null; }
+    return { b64: buf.toString('base64'), mt };
+  } catch (e) { logErr('glass.media', e); return null; }
+  finally { clearTimeout(tm); }
+}
+async function maybeGlassPhoto(s, text) {
+  try {
+    if (!(s.callerPack && s.callerPack.owner === true)) return null;   // owner line only
+    if (!IMG_REF.test(String(text || ''))) return null;
+    let url = await pendingPhotoUrl(s.from);
+    if (!url) { await new Promise(r => setTimeout(r, 3500)); url = await pendingPhotoUrl(s.from); }   // MMS can lag a few seconds
+    if (!url) return null;
+    const img = await fetchTwilioMedia(url);
+    if (img) logInfo('glass photo pulled into call ' + s.callSid + ' (' + img.b64.length + ' b64)');
+    return img;
+  } catch (e) { logErr('glass.maybePhoto', e); return null; }
+}
 async function handlePrompt(s, voicePrompt) {
   // a new utterance always cancels a stale in-flight turn (barge-in via speech)
   if (s.ctl) { try { s.ctl.abort(); } catch (e) {} }
@@ -505,12 +572,13 @@ async function handlePrompt(s, voicePrompt) {
   }
   const sys = String(pack.sys).replace(/\{\{CALLER_ID\}\}/g, s.from || 'unknown');
 
+  const glassImg = await maybeGlassPhoto(s, voicePrompt);   // v1.26: did he just send a photo he's now asking about?
   const ctl = new AbortController();
   s.ctl = ctl;
   let spoke = false;
   let raw = '';
   try {
-    raw = await aiTurn(sys, s.convo, tok => { spoke = true; sendText(s.ws, tok, false); }, ctl.signal);
+    raw = await aiTurn(sys, s.convo, tok => { spoke = true; sendText(s.ws, tok, false); }, ctl.signal, glassImg);
   } catch (e) {
     if (ctl.signal.aborted) return;    // superseded by a newer utterance — say nothing
     logErr('aiTurn', e);
@@ -692,8 +760,171 @@ function finalize(s) {
   }).catch(e => logErr('finalize', e));
 }
 
+
+// ---- v1.24 THE GLASSES DOOR ------------------------------------------------
+const ELEVEN_KEY = process.env.ELEVENLABS_API_KEY || '';
+let glassPack = null, glassPackAt = 0, glassUsedAt = 0, glassPackP = null;
+const glass = { convo: [], at: 0, turns: 0, last: null };
+function glassPackFetch() {
+  if (glassPackP) return glassPackP;
+  glassPackP = (async () => {
+    const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), 30000);
+    try {
+      const r = await fetch(GAS_URL + '?hook=brainpack&glass=1&k=' + encodeURIComponent(WKEY), { signal: ctl.signal, redirect: 'follow' });
+      const j = await r.json();
+      if (!j || !j.ok || !j.sys) throw new Error('bad glass pack: ' + JSON.stringify(j).slice(0, 120));
+      glassPack = j; glassPackAt = Date.now();
+      logInfo('glass pack refreshed (v' + j.v + ', ' + j.sys.length + ' chars)');
+      return j;
+    } catch (e) { logErr('glass.pack', e); return glassPack; }
+    finally { clearTimeout(tm); glassPackP = null; }
+  })();
+  return glassPackP;
+}
+async function glassPackGet() {
+  if (glassPack && Date.now() - glassPackAt < 4 * 60 * 1000) return glassPack;
+  if (glassPack) { glassPackFetch(); return glassPack; }      // stale is fine - refresh behind him
+  return await glassPackFetch();
+}
+// while the glasses are in use (last 30 min), keep the brain warm like the phone's
+setInterval(() => { if (glassUsedAt && Date.now() - glassUsedAt < 30 * 60 * 1000) glassPackFetch(); }, 4 * 60 * 1000);
+
+function glassVoiceMode() {
+  const v = glassPack && glassPack.voice;
+  if (ELEVEN_KEY && v && v.id) return 'phone-voice';
+  if (MEM_SAY_BASE || (glassPack && glassPack.sayBase)) return 'memory-voice';
+  return glassPack ? 'none' : 'unknown until first use';
+}
+const ELEVEN_MODELS = { turbo_v2_5: 'eleven_turbo_v2_5', flash_v2_5: 'eleven_flash_v2_5', turbo_v2: 'eleven_turbo_v2', flash_v2: 'eleven_flash_v2', multilingual_v2: 'eleven_multilingual_v2' };
+async function glassVoice(text) {
+  const t = String(text || '').replace(/\s+/g, ' ').trim().slice(0, 600);
+  if (!t) return null;
+  const v = glassPack && glassPack.voice;
+  const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), 12000);
+  try {
+    if (ELEVEN_KEY && v && v.id) {
+      const vs = { stability: v.stability != null ? v.stability : 0.5, similarity_boost: v.similarity != null ? v.similarity : 0.75 };
+      if (v.speed) vs.speed = v.speed;
+      const r = await fetch('https://api.elevenlabs.io/v1/text-to-speech/' + encodeURIComponent(v.id) + '?output_format=mp3_44100_64', {
+        method: 'POST', signal: ctl.signal,
+        headers: { 'xi-api-key': ELEVEN_KEY, 'content-type': 'application/json', accept: 'audio/mpeg' },
+        body: JSON.stringify({ text: t, model_id: ELEVEN_MODELS[v.model] || 'eleven_flash_v2_5', voice_settings: vs })
+      });
+      if (r.ok) return Buffer.from(await r.arrayBuffer());
+      logErr('glass.voice', 'elevenlabs ' + r.status + ': ' + (await r.text()).slice(0, 160));
+    }
+    const base = MEM_SAY_BASE || (glassPack && glassPack.sayBase) || '';
+    if (base) {
+      const r = await fetch(base + (base.includes('?') ? '&' : '?') + 'text=' + encodeURIComponent(t), { signal: ctl.signal });
+      if (r.ok && /audio/i.test(r.headers.get('content-type') || '')) return Buffer.from(await r.arrayBuffer());
+      logErr('glass.voice', 'memory /say ' + r.status + ' ' + (r.headers.get('content-type') || ''));
+    }
+  } catch (e) { logErr('glass.voice', e); }
+  finally { clearTimeout(tm); }
+  return null;
+}
+async function postGlassAct(act, said) {
+  const owner = (glassPack && glassPack.ownerPhone) || (genericPack && genericPack.owner) || CHRIS_CELL;
+  return postVoiceAct({ callSid: 'glass', from: owner, glass: true, said }, act);
+}
+function postGlassLog(q, say, photo, ms) {
+  const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), 30000);
+  fetch(GAS_URL + '?hook=glasslog&k=' + encodeURIComponent(WKEY), { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ q, say, photo: !!photo, ms }), redirect: 'follow', signal: ctl.signal })
+    .catch(e => logErr('glass.log', e)).finally(() => clearTimeout(tm));
+}
+async function glassTurn(q, img, mt, auto) {
+  const t0 = Date.now();
+  glassUsedAt = t0;
+  if (t0 - glass.at > 15 * 60 * 1000) glass.convo = [];   // a new conversation after 15 quiet minutes
+  glass.at = t0;
+  const pack = await glassPackGet();
+  if (!pack) return { ok: false, say: 'My brain did not load. Try me again in a few seconds.', brainMs: Date.now() - t0 };
+  const sys = String(pack.sys);
+  const text = String(q || '').trim().slice(0, 1500) || 'What am I looking at?';
+  const first = img ? [{ type: 'image', source: { type: 'base64', media_type: mt || 'image/jpeg', data: img } },
+                       { type: 'text', text: text + (auto ? '\n(A photo of what he is looking at came along automatically with his tap. Use it ONLY if his question is about something he can see; otherwise ignore it and never mention it.)' : '\n(The photo is what he is looking at right now.)') }] : text;
+  const convo = glass.convo.slice(-12);
+  while (convo.length && convo[0].role !== 'user') convo.shift();
+  convo.push({ role: 'user', content: first });
+  const keep = [{ role: 'user', content: text + (img ? ' [with a photo]' : '') }];
+  let raw = await aiTurn(sys, convo, () => {}, null);
+  let d = parseTurn(raw);
+  let say = (d && d.reply) ? String(d.reply) : '';
+  if (d && d.act && d.act.action) {
+    let act = d.act;
+    try {
+      let r = await postGlassAct(act, text);
+      if (READ_ACTS[act.action]) {
+        for (let depth = 0; depth < 2; depth++) {
+          const body = String((r && (r.result || r.error)) || 'no answer');
+          const note = '[RESULT of ' + act.action + ' — FOR YOU, NOT TO READ ALOUD. Answer his question from it in one to three short spoken sentences: '
+            + 'a count is a number, a yes/no is yes or no plus the one fact that proves it, a who/when is the name or the day. Never read rows, lists, ids, phone numbers or timestamps. If it does not answer him, say so plainly.]\n'
+            + body.slice(0, 6000);
+          convo.push({ role: 'assistant', content: String(say || 'Pulling that up.').slice(0, 500) });
+          convo.push({ role: 'user', content: note });
+          keep.push({ role: 'assistant', content: String(say || 'Pulling that up.').slice(0, 500) }, { role: 'user', content: note.slice(0, 1500) });
+          const d2 = parseTurn(await aiTurn(sys, convo, () => {}, null));
+          say = (d2 && d2.reply) ? String(d2.reply) : 'I pulled it up but lost my train of thought. Ask me that once more?';
+          if (depth === 0 && d2 && d2.act && d2.act.action && READ_ACTS[d2.act.action]) { act = d2.act; r = await postGlassAct(act, text); continue; }
+          break;
+        }
+      } else {
+        const res = String((r && (r.result || r.say)) || '').replace(/[✔✖✗⏳📅☎]/g, '').trim();
+        say = (r && r.ok) ? (res.slice(0, 240) || 'Done.') : (r && r.held) ? res : ('That did not go through: ' + String((r && r.error) || 'no answer from the office').slice(0, 120));
+      }
+    } catch (e) { logErr('glass.act', e); say = 'That did not go through on my end.'; }
+  }
+  if (!say) say = 'Say that one more time for me?';
+  keep.push({ role: 'assistant', content: say.slice(0, 500) });
+  glass.convo = glass.convo.concat(keep).slice(-16);
+  return { ok: true, say, brainMs: Date.now() - t0 };
+}
+function glassReadBody(req, limit) {
+  return new Promise((resolve, reject) => {
+    const chunks = []; let n = 0;
+    req.on('data', c => { n += c.length; if (n > limit) { reject(new Error('too big')); req.destroy(); } else chunks.push(c); });
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
+}
+async function glassHttp(req, res, u) {
+  const J = (code, obj) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(obj)); };
+  if (!WKEY || u.searchParams.get('k') !== WKEY) return J(403, { ok: false, say: 'The key in Aggie settings is wrong.' });
+  if (u.pathname === '/glass/warm') { glassUsedAt = Date.now(); const p = glassPackGet(); if (!glassPack) await Promise.race([p, new Promise(r => setTimeout(r, 20000))]); return J(200, { ok: !!glassPack, gateway: GW_VERSION, voice: glassVoiceMode() }); }
+  if (u.pathname === '/glass/say') {
+    if (!glassPack) await glassPackGet();
+    const buf = await glassVoice(u.searchParams.get('text') || '');
+    if (!buf) return J(503, { ok: false });
+    res.writeHead(200, { 'content-type': 'audio/mpeg', 'cache-control': 'private, max-age=86400' }); return res.end(buf);
+  }
+  if (u.pathname === '/glass' && req.method === 'POST') {
+    const t0 = Date.now();
+    let b = {};
+    try { b = JSON.parse(await glassReadBody(req, 9 * 1024 * 1024) || '{}') || {}; } catch (e) { return J(400, { ok: false, say: 'That photo was too big to send.' }); }
+    const img = typeof b.img === 'string' && b.img.length > 100 && b.img.length < 6500000 ? b.img : '';
+    let out;
+    try { out = await glassTurn(b.q, img, String(b.mt || 'image/jpeg'), b.auto === true); }
+    catch (e) { logErr('glass.turn', e); out = { ok: false, say: 'I hit a snag on my end. Ask me again?', brainMs: Date.now() - t0 }; }
+    const tv = Date.now();
+    const audio = await glassVoice(out.say);
+    const ms = { brainMs: out.brainMs, voiceMs: Date.now() - tv, totalMs: Date.now() - t0 };
+    glass.turns++; glass.last = Object.assign({ at: new Date().toISOString(), photo: !!img }, ms);
+    logInfo('glass turn ' + JSON.stringify(ms));
+    J(200, { ok: out.ok, say: out.say, audio: audio ? audio.toString('base64') : '', ms });
+    if (out.ok) postGlassLog(String(b.q || ''), out.say, !!img, ms);
+    return;
+  }
+  return J(404, { ok: false });
+}
+
 // ---- HTTP (health + keep-warm target) ---------------------------------------
 const server = http.createServer((req, res) => {
+  if (req.url && req.url.startsWith('/glass')) {   // v1.24 the glasses door
+    const gu = new URL(req.url, 'http://x');
+    glassHttp(req, res, gu).catch(e => { logErr('glass.http', e); try { res.writeHead(500, { 'content-type': 'application/json' }); res.end('{"ok":false,"say":"I hit a snag on my end."}'); } catch (e2) {} });
+    return;
+  }
   if (req.url && req.url.startsWith('/health')) {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({
@@ -704,6 +935,7 @@ const server = http.createServer((req, res) => {
       promptCache: lastUsage || 'no turns yet since restart',
       hands: acts.slice(-8),   // v1.17: the last voicebook round-trips — proof her hands work, or exactly why not
       turns: turns.slice(-30), turnLag: (function(){ const f = turns.map(t => t.firstMs).filter(x => x > 0); if (!f.length) return null; f.sort((a,b)=>a-b); return { n: f.length, p50: f[Math.floor(f.length/2)], p90: f[Math.floor(f.length*0.9)], max: f[f.length-1], interrupts: turns.reduce((a,t)=>a+(t.interrupts||0),0), silentTurns: turns.filter(t=>!t.tokens).length }; })(),   // v1.22: the lag she feels, in numbers
+      glass: { voice: glassVoiceMode(), brainAgeSec: glassPack ? Math.round((Date.now() - glassPackAt) / 1000) : null, turns: glass.turns, last: glass.last },   // v1.24
       recentErrors: errs.slice(-8)
     }, null, 2));
     return;
