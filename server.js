@@ -62,7 +62,7 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 
 // ---- config (all via environment; render.yaml wires these) -----------------
-const GW_VERSION = '1.27';
+const GW_VERSION = '1.28';
 const PORT       = process.env.PORT || 10000;
 const ANTHROPIC  = process.env.ANTHROPIC_API_KEY || '';
 const GAS_URL    = (process.env.GAS_EXEC_URL || '').replace(/\/+$/, ''); // full /exec URL, no query
@@ -154,6 +154,14 @@ function replyExtractor(emit) {
 
 async function aiTurn(sys, convo, onReplyText, signal, image) {
   let messages = convo;
+  // v1.28 THE CONVERSATION ENDS WITH THE CALLER (Sept 24 8:10 AM, owner line: 'anthropic 400: This model does not support
+  // assistant message prefill' -> transfer (AI turn failed) -> she dialed Chris while he was on with her -> voicemail).
+  // After an action ran, or a mission aborted, her own bracketed note was the LAST message; Opus 5 read that as a prefill
+  // and carried on, Sonnet 4.6 refuses it. A trailing assistant turn now gets a user nudge so every model can answer.
+  if (messages.length && messages[messages.length - 1].role === 'assistant') {
+    messages = messages.slice();
+    messages.push({ role: 'user', content: '[system: the result above is in. Say your next line to the caller now - spoken words only, same JSON shape as always.]' });
+  }
   if (image && image.b64) {
     // v1.26: fold the photo into the LAST user turn so she sees what he sent, this turn only
     messages = convo.slice();
@@ -705,6 +713,17 @@ async function handlePrompt(s, voicePrompt) {
 }
 
 async function doTransfer(s, why) {
+  // v1.28 NEVER TRANSFER A CALL TO THE PHONE THAT IS CALLING. The owner on his own cell can only ever land in his own
+  // voicemail. Say so, stay on the line, and log it - whatever the reason for the transfer was.
+  try {
+    var _from10 = String(s.from || '').replace(/\D/g, '').slice(-10), _to10 = String(CHRIS_CELL || '').replace(/\D/g, '').slice(-10);
+    if (_from10 && _from10 === _to10) {
+      logErr('transfer.self', 'refused: caller IS the transfer target (' + why + ') ' + s.callSid);
+      s.convo.push({ role: 'assistant', content: '[transfer refused: the caller is Chris himself - ' + why + ']' });
+      sendText(s.ws, 'Chris, I am not going to transfer you to your own phone. Something tripped on my side - go ahead, I am still here.', true);
+      return;
+    }
+  } catch (e) { logErr('transfer.selfcheck', e); }
   // v1.4: SHE DID NOT KNOW SHE TRANSFERRED. Her websocket closes the instant
   // the call moves to Chris, so her record ended mid-sentence and looked to
   // everyone — including her — like the call dropped. Now the handoff is
