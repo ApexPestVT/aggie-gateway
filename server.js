@@ -62,7 +62,7 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 
 // ---- config (all via environment; render.yaml wires these) -----------------
-const GW_VERSION = '1.28';
+const GW_VERSION = '1.31';
 const PORT       = process.env.PORT || 10000;
 const ANTHROPIC  = process.env.ANTHROPIC_API_KEY || '';
 const GAS_URL    = (process.env.GAS_EXEC_URL || '').replace(/\/+$/, ''); // full /exec URL, no query
@@ -340,7 +340,7 @@ async function postVoiceAct(s, act) {
 // v1.23 the reads: their results come back to HER, never read to the owner raw
 const READ_ACTS = { lookup:1, searchMemory:1, searchClients:1, searchJobs:1, searchInbox:1, readThread:1, lookupClient:1, lookupJob:1,
   mindReport:1, recallMemory:1, explainMemory:1, intentions:1, leadsRecent:1, salesBacklog:1, auditLeads:1, auditWon:1, previewPurge:1, cacheReport:1, callQueue:1 };
-const CUSTOMER_ACTS = { bookJob: 1, cancelJob: 1, noteJob: 1, confirmJob: 1, rescheduleJob: 1 };   // v1.18: + reschedule
+const CUSTOMER_ACTS = { bookJob: 1, cancelJob: 1, noteJob: 1, confirmJob: 1, rescheduleJob: 1, cardLink: 1, updateContact: 1, sendQuote: 1, tierSignup: 1, dncAdd: 1 };   // v1.31: + dncAdd   // v1.30: + tierSignup (she signs them up)   // v1.18: + reschedule · v1.29: + cardLink (tier sign-up -> Square link on the call)
 const FALLBACK_SAY = 'I will have Chris confirm that with you shortly.';
 async function postVoiceBook(s, act) {
   const u = GAS_URL + '?hook=voicebook&k=' + encodeURIComponent(WKEY);
@@ -377,9 +377,54 @@ function synthesizeAct(s, d) {
   const lead = Object.assign({}, s.lead || {}, (d && d.lead) || {});
   if (RX_SAID_CANCEL.test(reply)) return { action: 'cancelJob', data: { name: lead.name || '', phone: s.from, promised: reply.slice(0, 240), callerSaid: lastUser.slice(0, 200) } };
   if (RX_SAID_MOVED.test(reply) && (lead.day || lead.window)) return { action: 'rescheduleJob', data: { name: lead.name || '', phone: s.from, day: lead.day || '', window: lead.window || '', promised: reply.slice(0, 240), callerSaid: lastUser.slice(0, 200) } };
+  // v1.29 a spoken 'you're confirmed' with no act -> confirmJob (GAS stamps the waiting job from the caller's own yes; the post-call backstop catches the rest)
+  if (RX_SAID_CONFIRMED.test(reply)) return { action: 'confirmJob', data: { name: lead.name || '', phone: s.from, promised: reply.slice(0, 240), callerSaid: lastUser.slice(0, 200) } };
+  if (/\b(you(?:'|’)?re (?:all )?signed up|signed you up|welcome to the (?:standard|alpha|omega))\b/i.test(reply) && (s.tierTaken || (d && d.tierTaken))) return { action: 'tierSignup', data: { name: lead.name || '', phone: s.from, tier: String(s.tierTaken || d.tierTaken || ''), address: lead.address || '', email: lead.email || '', promised: reply.slice(0, 240), callerSaid: lastUser.slice(0, 200) } };   // v1.30
+  if (/\b((?:removed|taken|took) you (?:off|from) (?:our|the) list|you(?:'|’)?re off (?:our|the) list|won(?:'|’)?t (?:hear from|be contacted by) us)\b/i.test(reply)) return { action: 'dncAdd', data: { name: lead.name || '', phone: s.from, reason: lastUser.slice(0, 160), promised: reply.slice(0, 240), callerSaid: lastUser.slice(0, 200) } };   // v1.31
+  if (RX_SAID_CONTACT.test(reply) && (lead.address || lead.email)) return { action: 'updateContact', data: { name: lead.name || '', phone: s.from, address: lead.address || '', email: lead.email || '', promised: reply.slice(0, 240), callerSaid: lastUser.slice(0, 200) } };
+  if (RX_SAID_SENT.test(reply) && (lead.service || lead.pest)) return { action: 'sendQuote', data: { name: lead.name || '', phone: s.from, service: lead.service || lead.pest || '', promised: reply.slice(0, 240), callerSaid: lastUser.slice(0, 200) } };
   if (RX_SAID_NOTED.test(reply)) return { action: 'noteJob', data: { name: lead.name || '', phone: s.from, note: (reply.slice(0, 200) + (lastUser ? (' — caller said: “' + lastUser.slice(0, 120) + '”') : '')), promised: reply.slice(0, 240), callerSaid: lastUser.slice(0, 200) } };
   if (RX_SAID_BOOKED.test(reply) && (lead.day || lead.window)) return { action: 'bookJob', data: { name: lead.name || '', phone: s.from, address: lead.address || '', service: lead.service || lead.pest || '', day: lead.day || '', window: lead.window || '', price: lead.price || '', promised: reply.slice(0, 240), callerSaid: lastUser.slice(0, 200) } };
   return null;
+}
+
+// v1.29 THE MOUTH WAITS FOR THE HANDS (owner, Sept 24: "if she says it, it happens ... hard rules, no grey area").
+// Until now her reply streamed to the caller's ear token by token WHILE the model was still writing it, and the act ran
+// afterwards — so "you're all set for Friday the 26th" was spoken before the office could refuse it (Jacob Dalton: the 26th
+// was a Saturday; nothing was booked; he was told he was set). On every non-mission turn the reply is now BUFFERED: the
+// office writes first, then she speaks. If the office refuses, every sentence that claims a record changed is cut from her
+// words and the office's honest line takes its place. Cost: the caller hears her a second or two later than before.
+const RX_SAID_CONFIRMED = /\b(you(?:'|’)?re confirmed|confirmed (?:you |it |that )?for|i(?:'|’)?ve confirmed)\b/i;
+const RX_SAID_CARD = /\b((?:i(?:'|’)?ve |i |just )?(?:sent|texted|emailed) (?:you |over )?(?:the |a |your )?(?:card|payment|signup|sign-up|square) link|link (?:is )?(?:on its way|coming)|check your (?:texts?|phone) for the link)\b/i;
+const RX_SAID_SENT = /\b((?:i(?:'|’)?ve |i(?:'|’)?ll |i |just )(?:sent|send|emailed|email|texted|text|shot|shoot)(?:ing)? (?:you |that |it |over )?(?:over |along )?(?:the |a |your )?(?:quote|estimate|pricing|proposal|agreement|contract|paperwork|receipt|details|info(?:rmation)?)\b)/i;
+const RX_SAID_CONTACT = /\b((?:i(?:'|’)?ve |i |just )?(?:updated|changed|corrected|fixed|put|saved) (?:your |the )?(?:new )?(?:address|phone|number|email|contact (?:info|information))(?: on file)?)\b/i;
+const RX_SAID_ANY = [RX_SAID_BOOKED, RX_SAID_CANCEL, RX_SAID_MOVED, RX_SAID_NOTED, RX_SAID_CONFIRMED, RX_SAID_CARD, RX_SAID_SENT, RX_SAID_CONTACT];   // v1.29 1b: + sent / contact
+function saidClaims(reply) { const r = String(reply || ''); return RX_SAID_ANY.some(rx => rx.test(r)); }
+function stripClaims(reply) {
+  const sents = String(reply || '').split(/(?<=[.!?])\s+/);
+  const kept = sents.filter(x => !RX_SAID_ANY.some(rx => rx.test(x)));
+  return kept.join(' ').replace(/\s+/g, ' ').trim();
+}
+// what she says once the office has answered: her own words when they came true, the office's line when they did not
+// v1.31 (kit 673 parity): a callback promise carries no clock; a window job never gets a clock time in her mouth
+const RX_CALLBACK = /\b(?:(?:chris|he|someone|we|i)(?:'|’)?(?:ll| will) (?:call|ring|get back to|reach out to|text|follow up with|be in touch with) you(?: back)?|(?:have|ask|get) chris (?:call|ring|get back to|reach out to|text|follow up with) you(?: back)?)\b/i;
+const RX_CALLBACK_TIME = /\s*(?:,\s*)?\b(within (?:the |an? )?(?:hour|half hour|\d+ ?(?:minutes|mins|hours|hrs))|in (?:a few|a couple(?: of)?|\d+) ?(?:minutes|mins|hours|hrs)|by (?:noon|midday|\d{1,2}(?::\d{2})?\s*(?:am|pm|o(?:'|’)?clock)?|end of (?:the )?day|eod|tonight|this (?:morning|afternoon|evening)|close of business)|(?:first thing )?(?:tomorrow|today|tonight)(?: morning| afternoon| evening)?|right away|in a (?:bit|moment|minute)|momentarily|asap|as soon as possible|before (?:noon|\d{1,2}(?::\d{2})?\s*(?:am|pm)?|end of day|tonight|he leaves))\b/i;
+const RX_CLOCK = /\b(?:at|around|about|by|before|after)\s+(\d{1,2})(?::(\d{2}))?(?:\s*(am|pm|a\.m\.|p\.m\.|o(?:'|’)?clock))?\b(?!\s*(?:-|to|–)\s*\d)/i;
+function tidyPromises(reply, win) {
+  let out = String(reply || '');
+  out = out.split(/(?<=[.!?])\s+/).map(sent => {
+    let x = sent;
+    if (RX_CALLBACK.test(x)) { for (let i = 0; i < 3 && RX_CALLBACK_TIME.test(x); i++) x = x.replace(RX_CALLBACK_TIME, ''); x = x.replace(/\s{2,}/g, ' ').replace(/\s+([.!?,])/g, '$1'); }
+    if (win && RX_CLOCK.test(x)) { const ww = win === 'morning' ? 'between 8 and 12' : win === 'afternoon' ? 'between 12 and 5' : 'anytime that day'; x = x.replace(RX_CLOCK, ww).replace(/\s{2,}/g, ' '); }
+    return x;
+  }).join(' ');
+  return out;
+}
+function gateSpeak(reply, ok, line) {
+  if (ok) return String(reply || '').trim();
+  const rest = stripClaims(reply);
+  const L = String(line || FALLBACK_SAY).trim();
+  return (rest ? (rest + ' ') : '') + L;
 }
 
 // ---- per-call session -------------------------------------------------------
@@ -589,8 +634,9 @@ async function handlePrompt(s, voicePrompt) {
   s.ctl = ctl;
   let spoke = false;
   let raw = '';
+  const buffered = true;   // v1.29: every turn waits for the hands; 1b: missions too — they have no hands, so a claim on a mission call is cut, never spoken
   try {
-    raw = await aiTurn(sys, s.convo, tok => { spoke = true; sendText(s.ws, tok, false); }, ctl.signal, glassImg);
+    raw = await aiTurn(sys, s.convo, tok => { if (buffered) return; spoke = true; sendText(s.ws, tok, false); }, ctl.signal, glassImg);
   } catch (e) {
     if (ctl.signal.aborted) return;    // superseded by a newer utterance — say nothing
     logErr('aiTurn', e);
@@ -605,18 +651,22 @@ async function handlePrompt(s, voicePrompt) {
     else sendText(s.ws, '', true);
     return;
   }
-  if (!spoke) sendText(s.ws, d.reply, true);   // extractor missed (odd formatting) — speak the parsed reply
-  else sendText(s.ws, '', true);               // close the utterance
+  if (!buffered) {
+    if (!spoke) sendText(s.ws, d.reply, true);   // extractor missed (odd formatting) — speak the parsed reply
+    else sendText(s.ws, '', true);               // close the utterance
+  }
 
   s.convo.push({ role: 'assistant', content: String(d.reply).slice(0, 500) });
   mergeLead(s.lead, d.lead);   // v1.17: merge BEFORE the hands, so a synthesized act sees this turn's extraction
   const isOwner = !!(s.callerPack && s.callerPack.owner === true);
+  let spokenThisTurn = false;   // v1.29: buffered turns speak exactly once, below, after the office has answered
   // v1.9 THE OWNER LINE. When the pack said owner:true, the brain is AGI and a
   // turn may carry `act` — a chat-bubble action the owner just approved out
   // loud. Post it to GAS (hook=voiceact, owner-number checked there too),
   // speak the result, and remember it in the convo so the next turn knows.
   if (d.act && d.act.action && isOwner) {
     try {
+      if (buffered && READ_ACTS[d.act.action] && d.reply) { sendText(s.ws, String(d.reply), true); spokenThisTurn = true; }   // v1.29 a read: her lead-in line, then the answer turn below
       const r = await postVoiceAct(s, d.act);
       // v1.10 A LOOKUP IS A THOUGHT, NOT A LINE. v1.23: so is EVERY read. The result goes back into the
       // conversation as a note; she takes another turn with it in hand and ANSWERS — the owner hears the
@@ -648,10 +698,12 @@ async function handlePrompt(s, voicePrompt) {
         return;
       }
       const said = r && r.ok ? String(r.result || 'Done.').replace(/[\u2714\u2716\u2717\u23f3\ud83d\udcc5\u260e]/g, '').trim().slice(0, 240) : ('That did not go through: ' + String((r && r.error) || 'no answer from the office').slice(0, 120));
-      sendText(s.ws, said, true);
+      // v1.29: on a buffered turn her own words come first with any 'done' claim cut out, then the office's verdict
+      if (buffered) { const lead = stripClaims(d.reply); sendText(s.ws, (lead ? (lead + ' ') : '') + said, true); spokenThisTurn = true; }
+      else sendText(s.ws, said, true);
       s.convo.push({ role: 'assistant', content: '[ran ' + d.act.action + ': ' + said.slice(0, 200) + ']' });
     } catch (e) { logErr('voiceact', e); sendText(s.ws, 'That action did not go through on my end.', true); }
-  } else if (!isOwner && !s.mid) {
+  } else if (!isOwner) {   // v1.30 MISSIONS HAVE HANDS (owner, Sept 25 5:02 AM: 'Fix both those') — an outbound call books/moves/cancels/signs up through the same office door as an inbound one
     // v1.17 THE CUSTOMER LINE'S HANDS. Her act, or the one her words imply,
     // rides to GAS while the caller is still on the line. Whatever GAS hands
     // back as `say` is what she says next — a real confirmation on ok, the
@@ -662,6 +714,7 @@ async function handlePrompt(s, voicePrompt) {
     // v1.20 ONE BOOKING PER CALL: once a bookJob landed, her recaps do not re-book (the second act failed the
     // evidence gate on 'thanks' and spoke 'Chris will confirm' after a perfectly good booking).
     if (act && synthesized && act.action === 'bookJob' && s.actsRan.some(a => a.action === 'bookJob' && a.ok)) act = null;
+    if (act && act.action === 'tierSignup' && s.actsRan.some(a => a.action === 'tierSignup' && a.ok)) act = null;   // v1.30 one sign-up per call
     if (d.act && d.act.action && !CUSTOMER_ACTS[d.act.action]) logErr('voicebook.refused', 'non-customer act ' + d.act.action + ' on ' + s.callSid + ' — ignored');
     if (act) {
       act.data = act.data || {};
@@ -676,14 +729,32 @@ async function handlePrompt(s, voicePrompt) {
         const line = String((r && r.say) || FALLBACK_SAY).slice(0, 240);
         const ok = !!(r && r.ok);
         s.actsRan.push({ action: act.action, ok, woId: (r && r.woId) || '', synthesized, error: (r && r.error) || '' });
-        // ok: only speak the office's line when her own reply did not already say it (avoid "You're set. You're on the books.")
-        // not ok: ALWAYS speak the fallback — her words promised something the record could not hold.
-        if ((!ok || synthesized) && line && !(r && r.recap)) sendText(s.ws, line, true);   // v1.20: a recap answer carries no line to speak
+        if (buffered) {
+          // v1.29 THE GATE: the office answered BEFORE she spoke. ok -> her words stand (they came true; add the office line only when
+          // she did not already say it herself). not ok -> every claim sentence is cut and the office's honest line is spoken instead.
+          let say;
+          if (ok) say = (r && r.recap) ? String(d.reply) : (synthesized ? String(d.reply) : (String(d.reply) + (line && !saidClaims(d.reply) ? (' ' + line) : '')));
+          else say = gateSpeak(d.reply, false, line);
+          say = tidyPromises(say, ok ? String((r && r.window) || '').toLowerCase() : '');   // v1.31 no clock on a callback; the window, not a clock, on a window job
+          sendText(s.ws, say.slice(0, 600), true); spokenThisTurn = true;
+          if (!ok) logInfo('gate-held ' + act.action + ' on ' + s.callSid + ': "' + String(d.reply).slice(0, 100) + '" -> "' + line.slice(0, 80) + '"');
+        } else {
+          // ok: only speak the office's line when her own reply did not already say it (avoid "You're set. You're on the books.")
+          // not ok: ALWAYS speak the fallback — her words promised something the record could not hold.
+          if ((!ok || synthesized) && line && !(r && r.recap)) sendText(s.ws, line, true);   // v1.20: a recap answer carries no line to speak
+        }
         s.convo.push({ role: 'assistant', content: '[' + (ok ? 'ran ' : 'FAILED ') + act.action + (synthesized ? ' (from my own words)' : '') + ': ' + (ok ? line : String((r && r.error) || 'no answer')).slice(0, 200) + ']' });
         logInfo('voicebook ' + act.action + (synthesized ? ' (synth)' : '') + ' ' + (ok ? 'ok ' + ((r && r.woId) || '') : 'FAIL ' + ((r && r.error) || '')) + ' on ' + s.callSid);
-      } catch (e) { logErr('voicebook', e); sendText(s.ws, FALLBACK_SAY, true); }
+      } catch (e) { logErr('voicebook', e); sendText(s.ws, buffered ? gateSpeak(d.reply, false, FALLBACK_SAY) : FALLBACK_SAY, true); spokenThisTurn = true; }
+    } else if (buffered && saidClaims(d.reply)) {
+      // v1.29 no act could be built (no day, no window, nothing to move) yet her words claim a record changed: cut the claim, say the honest line
+      const say = tidyPromises(gateSpeak(d.reply, false, FALLBACK_SAY), '');
+      sendText(s.ws, say.slice(0, 600), true); spokenThisTurn = true;
+      logInfo('gate-held (no act) on ' + s.callSid + ': "' + String(d.reply).slice(0, 120) + '"');
+      s.convo.push({ role: 'assistant', content: '[GATE: I claimed something was booked/moved/canceled/noted but no act could be built — the caller heard: ' + say.slice(0, 160) + ']' });
     }
   }
+  if (buffered && !spokenThisTurn) sendText(s.ws, isOwner ? String(d.reply) : tidyPromises(d.reply, ''), true);   // v1.29 nothing to check on this turn — speak her words (v1.31: minus any callback clock)
   if (d.flagOwner) s.flag = true;
   if (d.commercial) s.commercial = true;
   if (d.tierOffered) s.tierOffered = true;
