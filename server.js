@@ -62,7 +62,7 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 
 // ---- config (all via environment; render.yaml wires these) -----------------
-const GW_VERSION = '1.31';
+const GW_VERSION = '1.32';
 const PORT       = process.env.PORT || 10000;
 const ANTHROPIC  = process.env.ANTHROPIC_API_KEY || '';
 const GAS_URL    = (process.env.GAS_EXEC_URL || '').replace(/\/+$/, ''); // full /exec URL, no query
@@ -602,14 +602,11 @@ async function handlePrompt(s, voicePrompt) {
         return;
       }
     } else {
+      // v1.32 NO DEAD AIR (Dawna Cao, Sept 25 7:30 AM: the office took >25s to hand over her file; she heard the greeting,
+      // 'one second', then silence, and hung up at 21s). The first turn waits 3s for the caller file, then runs on the
+      // generic brain right away; the file is swapped in on the next turn when it lands. No second wait, no filler line.
       try { await Promise.race([ s.packPromise, new Promise(res => setTimeout(res, first ? 3000 : 800)) ]); } catch (e) {}
-      if (!s.callerPack && first) {
-        // v1.21 THE REFLEX MUST NOT ASSUME AN ACCOUNT (Aggie's journal, Sept 17: said 'pull up your account' to a
-        // salesperson who never had one). The pack is not here yet at this point, so the line is neutral unless it is.
-        sendText(s.ws, (s.callerPack && s.callerPack.known) ? 'One second while I pull up your account.' : 'One second — bear with me.', true);
-        try { await Promise.race([ s.packPromise, new Promise(res => setTimeout(res, 6000)) ]); } catch (e) {}
-        if (!s.callerPack) logErr('pack.late', 'caller pack still not landed after 9s for ' + s.callSid + ' — first turn runs generic');
-      }
+      if (!s.callerPack && first) logErr('pack.late', 'caller pack not here after 3s for ' + s.callSid + ' — first turn runs generic, file swaps in when it lands');
     }
   }
   let pack = s.callerPack || genericPack;
@@ -1072,8 +1069,8 @@ wss.on('connection', (ws, mid) => {
       // v1.3 MISSIONS: an assignment brain, fetched by mid — never the
       // receptionist booking script. Same race, same patience, same rails.
       s.packPromise = (s.mid ? fetchPack('', 25000, s.mid) : fetchPack(s.from, 25000))
-        .then(p => { if (p) { s.callerPack = p; logInfo('caller pack landed for ' + s.callSid); } return p; })
-        .catch(e => { logErr('pack.caller', e); return null; });
+        .catch(e => { logErr('pack.caller', e); return s.mid ? null : fetchPack(s.from, 25000).catch(e2 => { logErr('pack.caller.retry', e2); return null; }); })   // v1.32 one retry - the kit caches the file per phone now, so the second ask is usually instant
+        .then(p => { if (p) { s.callerPack = p; logInfo('caller pack landed for ' + s.callSid); } return p; });
       startRecording(s);   // v1.1: every live call is recorded, like v23.5 days
     }
     else if (m.type === 'prompt' && m.voicePrompt) {
