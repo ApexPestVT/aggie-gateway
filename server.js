@@ -62,7 +62,7 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 
 // ---- config (all via environment; render.yaml wires these) -----------------
-const GW_VERSION = '1.32';
+const GW_VERSION = '1.36';
 const PORT       = process.env.PORT || 10000;
 const ANTHROPIC  = process.env.ANTHROPIC_API_KEY || '';
 const GAS_URL    = (process.env.GAS_EXEC_URL || '').replace(/\/+$/, ''); // full /exec URL, no query
@@ -191,11 +191,11 @@ async function aiTurn(sys, convo, onReplyText, signal, image) {
     // her brain offline. Marking it cacheable means the first turn of a call
     // pays full price and every turn after reads from cache at a tenth the
     // cost. Same prompt, same behaviour, same voice — only the bill changes.
-    body: JSON.stringify({
+    body: wellFormed(JSON.stringify({
       model: MODEL, max_tokens: MAX_TOKENS,
       system: [{ type: 'text', text: sys, cache_control: { type: 'ephemeral' } }],
       messages, stream: true
-    })
+    }))
   });
   if (!r.ok) throw new Error('anthropic ' + r.status + ': ' + (await r.text()).slice(0, 200));
   const feed = replyExtractor(onReplyText);
@@ -341,10 +341,21 @@ async function postVoiceAct(s, act) {
 const READ_ACTS = { lookup:1, searchMemory:1, searchClients:1, searchJobs:1, searchInbox:1, readThread:1, lookupClient:1, lookupJob:1,
   mindReport:1, recallMemory:1, explainMemory:1, intentions:1, leadsRecent:1, salesBacklog:1, auditLeads:1, auditWon:1, previewPurge:1, cacheReport:1, callQueue:1 };
 const CUSTOMER_ACTS = { bookJob: 1, cancelJob: 1, noteJob: 1, confirmJob: 1, rescheduleJob: 1, cardLink: 1, updateContact: 1, sendQuote: 1, tierSignup: 1, dncAdd: 1 };   // v1.31: + dncAdd   // v1.30: + tierSignup (she signs them up)   // v1.18: + reschedule · v1.29: + cardLink (tier sign-up -> Square link on the call)
-const FALLBACK_SAY = 'I will have Chris confirm that with you shortly.';
-async function postVoiceBook(s, act) {
+// v1.36 no more 'Chris will confirm' (owner: no hand-offs). If the office is slow she says she is saving it; the promise net + office retry finish the job.
+const FALLBACK_SAY = 'One moment while I check on that.';
+// v1.36 THE LONE SURROGATE (Sept 26 14:20 aiTurn 400 'invalid high surrogate in string'): a pack/thread string cut mid-emoji poisoned the whole
+// request and the turn died. Every request body is made well-formed before it leaves.
+function wellFormed(str) {
+  const s = String(str || '');
+  if (typeof s.toWellFormed === 'function') return s.toWellFormed();
+  return s.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/g, '\uFFFD').replace(/(^|[^\uD800-\uDBFF])([\uDC00-\uDFFF])/g, '$1\uFFFD');
+}
+async function postVoiceBook(s, act, _retry) {
+  // v1.36 (health log Sept 25: seven bookJob 'This operation was aborted' at 8000 ms). The office's write chain can outrun 8 s on a
+  // busy sheet; the kit keeps running after the cut, so the job often DID save. One retry after an abort: the kit answers an
+  // existing same-day job as a recap (ok:true), so she tells the truth instead of 'I will have Chris confirm'.
   const u = GAS_URL + '?hook=voicebook&k=' + encodeURIComponent(WKEY);
-  const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), 8000);
+  const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), _retry ? 10000 : 8000);
   const t0 = Date.now();
   try {
     const r = await fetch(u, { method: 'POST', headers: { 'content-type': 'application/json' },
@@ -355,8 +366,10 @@ async function postVoiceBook(s, act) {
     while (acts.length > 12) acts.shift();
     return j;
   } catch (e) {
-    acts.push({ at: new Date().toISOString(), sid: s.callSid, action: act.action, ok: false, ms: Date.now() - t0, error: String((e && e.message) || e).slice(0, 80) });
+    acts.push({ at: new Date().toISOString(), sid: s.callSid, action: act.action, ok: false, ms: Date.now() - t0, error: String((e && e.message) || e).slice(0, 80) + (_retry ? ' (retry)' : '') });
     while (acts.length > 12) acts.shift();
+    clearTimeout(tm);
+    if (!_retry && /abort/i.test(String((e && e.message) || e))) return postVoiceBook(s, act, true);   // v1.36 one more try, then the honest line
     return { ok: false, error: String((e && e.message) || e).slice(0, 120), say: FALLBACK_SAY };
   } finally { clearTimeout(tm); }
 }
@@ -419,6 +432,31 @@ function tidyPromises(reply, win) {
     return x;
   }).join(' ');
   return out;
+}
+// v1.33 THE OWNER LINE (Sept 25 10:39, Sandy $0): she said 'Done. Sandy's job is set to 0.' before the office refused three times;
+// then 'One moment while I try Chris for you' - to Chris, on his own line. Owner-claim sentences are cut when the office says no,
+// and a transfer line on the owner line is never spoken and never dialed.
+const RX_OWNER_CLAIM = /(^|\s)(?:done|all set|on it|consider it done)\b|\b(?:i(?:'|’)?ve |i |just )?(?:set|updated|changed|moved|marked|zeroed|voided|rescheduled|cancel+ed|noted|sent|texted|emailed|booked|charged|invoiced)\b[^.!?]*\b(?:to|as|for|on)\b/i;
+function stripOwnerClaims(reply) {
+  return String(reply || '').split(/(?<=[.!?])\s+/).filter(x => !RX_OWNER_CLAIM.test(x) && !/^\s*done\.?\s*$/i.test(x)).join(' ').trim();
+}
+const RX_TRANSFER_LINE = /[^.!?]*\b(?:one moment|hold on|hang on|just a (?:second|moment|sec)|let me)\b[^.!?]*\b(?:try|get|grab|connect you|transfer(?:ring)? you|put you through|reach)\b[^.!?]*\b(?:chris|him)\b[^.!?]*[.!?]?/i;
+function stripTransferLine(reply) { return String(reply || '').replace(RX_TRANSFER_LINE, '').replace(/\s{2,}/g, ' ').trim(); }
+// v1.35 THE HAND-OFF RULE ON THE PHONE (owner, Sept 25: 'I do not want to talk to a client unless strictly necessary'). A customer
+// sentence that hands them to Chris is removed unless the call is commercial or the sentence is about money; a scheduling hand-off
+// becomes the booking question. Missions and the owner line are untouched.
+const RX_HANDOFF = /\b(?:chris|he)(?:'|’)?(?:ll| will) (?:call|ring|get back to|reach out(?: to)?|follow up(?: with)?|confirm|text|send|be in touch|get in touch|contact|take care of|go over|look at|walk you through)\b|\bi(?:'|’)?(?:ll| will) have chris\b|\bhave chris (?:call|confirm|reach|get back|follow|text|send|look|contact)\b|\bi(?:'|’)?(?:ll| will) (?:pass|send|flag) (?:this|that|it) (?:along )?to chris\b/i;
+const RX_HANDOFF_OK = /\b(refund|charg|bill|invoice|discount|price|pricing|quote|cost|pay|payment|card|commercial|business|restaurant|property manag|building|termite|bat|contract|estimate|dispute|credit)/i;
+const ASK_DAY = 'Just so I lock it in right — which day works best for you, morning or afternoon?';
+function stripHandoff(reply) {
+  let asked = false, cut = 0;
+  const out = String(reply || '').split(/(?<=[.!?])\s+/).map(x => {
+    if (!RX_HANDOFF.test(x) || RX_HANDOFF_OK.test(x)) return x;
+    cut++;
+    if (/\b(time|day|date|schedul|appointment|visit|book|window|come out|when)\b/i.test(x) && !asked) { asked = true; return ASK_DAY; }
+    return '';
+  }).filter(Boolean).join(' ').trim();
+  return { text: out || (cut ? 'Is there anything else I can take care of for you right now?' : String(reply || '')), cut };
 }
 function gateSpeak(reply, ok, line) {
   if (ok) return String(reply || '').trim();
@@ -656,7 +694,16 @@ async function handlePrompt(s, voicePrompt) {
   s.convo.push({ role: 'assistant', content: String(d.reply).slice(0, 500) });
   mergeLead(s.lead, d.lead);   // v1.17: merge BEFORE the hands, so a synthesized act sees this turn's extraction
   const isOwner = !!(s.callerPack && s.callerPack.owner === true);
+  if (isOwner && (d.transfer || RX_TRANSFER_LINE.test(String(d.reply || '')))) {   // v1.33 the owner is never transferred to himself
+    logInfo('owner-line transfer suppressed on ' + s.callSid + ': "' + String(d.reply).slice(0, 100) + '"');
+    d.transfer = false; d.reply = stripTransferLine(d.reply) || 'Go ahead, sir — I\'m listening.';
+    raw = String(raw || '').replace(RX_TRANSFER_LINE, '');
+  }
   let spokenThisTurn = false;   // v1.29: buffered turns speak exactly once, below, after the office has answered
+  if (!isOwner && !s.mid && !(d.commercial || s.commercial)) {   // v1.35 the hand-off rule
+    const h = stripHandoff(d.reply);
+    if (h.cut) { logInfo('handoff removed on ' + s.callSid + ': "' + String(d.reply).slice(0, 120) + '" -> "' + h.text.slice(0, 80) + '"'); d.reply = h.text; s.convo[s.convo.length - 1].content = String(d.reply).slice(0, 500); }
+  }
   // v1.9 THE OWNER LINE. When the pack said owner:true, the brain is AGI and a
   // turn may carry `act` — a chat-bubble action the owner just approved out
   // loud. Post it to GAS (hook=voiceact, owner-number checked there too),
@@ -696,7 +743,7 @@ async function handlePrompt(s, voicePrompt) {
       }
       const said = r && r.ok ? String(r.result || 'Done.').replace(/[\u2714\u2716\u2717\u23f3\ud83d\udcc5\u260e]/g, '').trim().slice(0, 240) : ('That did not go through: ' + String((r && r.error) || 'no answer from the office').slice(0, 120));
       // v1.29: on a buffered turn her own words come first with any 'done' claim cut out, then the office's verdict
-      if (buffered) { const lead = stripClaims(d.reply); sendText(s.ws, (lead ? (lead + ' ') : '') + said, true); spokenThisTurn = true; }
+      if (buffered) { const lead = (r && r.ok) ? stripClaims(d.reply) : stripOwnerClaims(stripClaims(d.reply)); sendText(s.ws, (lead ? (lead + ' ') : '') + said, true); spokenThisTurn = true; }   // v1.33 no 'Done' over a refusal
       else sendText(s.ws, said, true);
       s.convo.push({ role: 'assistant', content: '[ran ' + d.act.action + ': ' + said.slice(0, 200) + ']' });
     } catch (e) { logErr('voiceact', e); sendText(s.ws, 'That action did not go through on my end.', true); }
@@ -720,7 +767,20 @@ async function handlePrompt(s, voicePrompt) {
       // whatever she already extracted across the call rides with the act when the act itself left it blank.
       try { const L = s.lead || {}; ['name','address','email','service','pest','day','window'].forEach(k => { if (!act.data[k] && L[k]) act.data[k] = L[k]; }); if (!act.data.service && act.data.pest) act.data.service = act.data.pest; } catch (e) {}
       act.data.promised = act.data.promised || String(d.reply).slice(0, 240);
-      if (!act.data.callerSaid) { for (let i = s.convo.length - 1; i >= 0; i--) { if (s.convo[i].role === 'user' && !/^\[/.test(String(s.convo[i].content || ''))) { act.data.callerSaid = String(s.convo[i].content || '').slice(0, 200); break; } } }
+      // v1.34 THE AGREEING WORDS, NOT THE LAST WORDS (Amanda Thibault, Sept 25: 'Friday the 2nd in the morning' four turns back; her
+      // last words at act time were 'Nope' / 'Thank you' -> held twice). For bookJob / rescheduleJob / confirmJob the caller's
+      // agreement is the most recent caller turn that carries a yes OR a day / window / date, looked back up to 8 turns.
+      if (!act.data.callerSaid || /^(bookJob|rescheduleJob|confirmJob)$/.test(act.action)) {
+        const RX_AGREE = /\b(yes|yeah|yep|yup|sure|ok(?:ay)?|that works|sounds good|perfect|book (?:me|it|that)|let(?:'|’)?s do (?:it|that)|go ahead|please do|sign me up|put me down|mon|tue|wed|thu|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday|morning|afternoon|anytime|tomorrow|the \d{1,2}(?:st|nd|rd|th))\b|\b\d{1,2}\/\d{1,2}\b/i;
+        let picked = '', last = '', seen = 0;
+        for (let i = s.convo.length - 1; i >= 0 && seen < 8; i--) {
+          if (s.convo[i].role !== 'user' || /^\[/.test(String(s.convo[i].content || ''))) continue;
+          const u = String(s.convo[i].content || ''); seen++;
+          if (!last) last = u;
+          if (RX_AGREE.test(u)) { picked = u; break; }
+        }
+        act.data.callerSaid = (picked || act.data.callerSaid || last).slice(0, 200);
+      }
       try {
         const r = await postVoiceBook(s, act);
         const line = String((r && r.say) || FALLBACK_SAY).slice(0, 240);
@@ -758,14 +818,14 @@ async function handlePrompt(s, voicePrompt) {
   if (d.tierTaken) s.tierTaken = String(d.tierTaken);
   if (d.sched && d.sched.action) s.sched = d.sched;
 
-  if (d.transfer) return doTransfer(s, 'caller asked');
+  if (d.transfer && !isOwner) return doTransfer(s, 'caller asked');
   // v1.12 HER MOUTH BINDS HER PLUMBING (owner, Sept 12: caller asked for a
   // person, she said "One moment while I try Chris for you" — and the
   // transfer flag never came, so the socket stayed open, the caller sat in
   // silence and hung up; zero calls reached his phone, a $350 quote walked).
   // If she TELLS the caller she is getting Chris, that IS the transfer,
   // JSON flag or not — the words she speaks to a customer are commitments.
-  if (/\b(one moment|hold on|hang on|just a (second|moment|sec))?[^.]*\b(try|get|grab|connect you (?:to|with)|transfer(?:ring)? you to|put you through to)\s+(chris|him)\b/i.test(String(raw||''))) {
+  if (!isOwner && /\b(one moment|hold on|hang on|just a (second|moment|sec))?[^.]*\b(try|get|grab|connect you (?:to|with)|transfer(?:ring)? you to|put you through to)\s+(chris|him)\b/i.test(String(raw||''))) {   // v1.33 never on the owner line
     return doTransfer(s, 'spoken-intent');
   }
   if (d.done) {
