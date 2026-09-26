@@ -62,7 +62,7 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 
 // ---- config (all via environment; render.yaml wires these) -----------------
-const GW_VERSION = '1.36';
+const GW_VERSION = '1.37';
 const PORT       = process.env.PORT || 10000;
 const ANTHROPIC  = process.env.ANTHROPIC_API_KEY || '';
 const GAS_URL    = (process.env.GAS_EXEC_URL || '').replace(/\/+$/, ''); // full /exec URL, no query
@@ -384,6 +384,11 @@ const RX_SAID_BOOKED = /\b((?:you(?:'|’)?re|you are) (?:all )?set|on the (?:bo
 const RX_SAID_CANCEL = /\b((?:it(?:'|’)?s|that(?:'|’)?s|that one(?:'|’)?s|you(?:'|’)?re) (?:all )?(?:canceled|cancelled)|(?:i(?:'|’)?ve )?(?:canceled|cancelled) (?:it|that|your|the)|taken (?:it|that|you) off (?:the|our) (?:schedule|books|calendar)|off the schedule)\b/i;
 const RX_SAID_MOVED  = /\b(moved (?:you|it|that|your visit) to|you(?:'|’)?re (?:now )?(?:moved|rescheduled) (?:to|for)|rescheduled (?:you|it|that|your visit) (?:to|for)|new (?:day|date) is)\b/i;
 const RX_SAID_NOTED  = /\b(i(?:'|’)?ve noted|i noted|noted (?:on|for)|on (?:the|your) work ?order|tech (?:comes|will come|will be) prepared|i(?:'|’)?ll (?:make a note|note that)|added (?:it|that) to (?:this|your|the) visit)\b/i;
+// v1.37 the identity of an act inside one call: what + who + which day
+function actKey(a) {
+  const d = (a && a.data) || {};
+  return String(a.action || '') + '|' + String(d.name || '').toLowerCase().replace(/\s+/g, ' ').trim() + '|' + String(d.day || d.newDate || d.date || '').toLowerCase().trim();
+}
 function synthesizeAct(s, d) {
   const reply = String((d && d.reply) || '');
   const lastUser = (function () { for (let i = s.convo.length - 1; i >= 0; i--) { if (s.convo[i].role === 'user' && !/^\[/.test(String(s.convo[i].content || ''))) return String(s.convo[i].content || ''); } return ''; })();
@@ -758,6 +763,20 @@ async function handlePrompt(s, voicePrompt) {
     // v1.20 ONE BOOKING PER CALL: once a bookJob landed, her recaps do not re-book (the second act failed the
     // evidence gate on 'thanks' and spoke 'Chris will confirm' after a perfectly good booking).
     if (act && synthesized && act.action === 'bookJob' && s.actsRan.some(a => a.action === 'bookJob' && a.ok)) act = null;
+    // v1.37 ONE ACT PER JOB PER CALL (owner line, Sept 26 3:55 PM: 'move every job to Sunday'. Each move landed, then her own
+    // narration 'Moved Charlie Thomas ... to Sunday' matched RX_SAID_MOVED and SYNTHESIZED the same rescheduleJob again -> the office
+    // said 'No Charlie Thomas job on 9/26' (already moved) -> she believed it failed, told the owner 2 of 8, and stopped. Three jobs
+    // had moved; she never touched the other four.) A synthesized act never repeats a success; a real re-emit of the same
+    // move/cancel/confirm/book for the same name and day is answered from the earlier success instead of running again.
+    if (act) {
+      const _k = actKey(act);
+      const prior = s.actsRan.find(a => a.ok && a.key === _k);
+      if (prior && (synthesized || /^(rescheduleJob|cancelJob|confirmJob|bookJob)$/.test(act.action))) {
+        s.convo.push({ role: 'assistant', content: '[already done this call: ' + act.action + ' for ' + String((act.data && act.data.name) || '').slice(0, 40) + ' succeeded earlier' + (prior.woId ? ' (' + prior.woId + ')' : '') + ' — do not repeat it; move on to the next one]' });
+        logInfo('voicebook ' + act.action + (synthesized ? ' (synth)' : '') + ' skipped: already done for ' + _k + ' on ' + s.callSid);
+        act = null;
+      }
+    }
     if (act && act.action === 'tierSignup' && s.actsRan.some(a => a.action === 'tierSignup' && a.ok)) act = null;   // v1.30 one sign-up per call
     if (d.act && d.act.action && !CUSTOMER_ACTS[d.act.action]) logErr('voicebook.refused', 'non-customer act ' + d.act.action + ' on ' + s.callSid + ' — ignored');
     if (act) {
@@ -785,7 +804,7 @@ async function handlePrompt(s, voicePrompt) {
         const r = await postVoiceBook(s, act);
         const line = String((r && r.say) || FALLBACK_SAY).slice(0, 240);
         const ok = !!(r && r.ok);
-        s.actsRan.push({ action: act.action, ok, woId: (r && r.woId) || '', synthesized, error: (r && r.error) || '' });
+        s.actsRan.push({ action: act.action, ok, woId: (r && r.woId) || '', synthesized, error: (r && r.error) || '', key: actKey(act) });   // v1.37 key
         if (buffered) {
           // v1.29 THE GATE: the office answered BEFORE she spoke. ok -> her words stand (they came true; add the office line only when
           // she did not already say it herself). not ok -> every claim sentence is cut and the office's honest line is spoken instead.
