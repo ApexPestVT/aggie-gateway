@@ -62,7 +62,7 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 
 // ---- config (all via environment; render.yaml wires these) -----------------
-const GW_VERSION = '1.37';
+const GW_VERSION = '1.38';
 const PORT       = process.env.PORT || 10000;
 const ANTHROPIC  = process.env.ANTHROPIC_API_KEY || '';
 const GAS_URL    = (process.env.GAS_EXEC_URL || '').replace(/\/+$/, ''); // full /exec URL, no query
@@ -322,15 +322,36 @@ async function postResults(payload) {
 }
 
 // v1.9: owner-line action ramp (one try, 20s — the owner is waiting on the line)
-async function postVoiceAct(s, act) {
+// v1.38 THE OFFICE IS SLOW, NOT BROKEN (owner line, Sept 27 10:20 AM: every move that SAVED took 20+ s in the kit - Jim Burrows'
+// first move finished one second AFTER the re-fire that found him already moved. The gateway quit at 20 s, said 'That action did not
+// go through on my end', she re-fired, the office said 'already there', and she told the owner the system had moved them by itself.)
+// A write now gets 20 s, then a spoken 'still saving' line, then one more 25 s try of the SAME act - a reschedule is idempotent, so the
+// second answer ('already there' or the move itself) is the truth either way. Reads and refusals answer fast and never reach the retry.
+// Only acts that are safe to run twice get the second try. A text, a charge, an invoice, a new record or a sign-up is NOT retried:
+// if the first one landed after the cut, a retry would send or charge twice - she is told it may have gone through and to look first.
+const IDEMPOTENT_ACTS = /^(rescheduleJob|voidJob|updateLead|updateClient|checklistDone|obligationClose|dutyDone|cancelCall|cancelText|forgetMemory|inboxArchive)$/;
+const ONESHOT_ACTS = /^(createWorkOrder|createLead|sendInvoice|chargeCard|tierSignup|smsReply|scheduleText|scheduleCall|checklistAdd|routeBuild|emailReply|rememberThis)$/;
+async function postVoiceActOnce(s, act, ms) {
   const u = GAS_URL + '?hook=voiceact&k=' + encodeURIComponent(WKEY);
-  const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), 20000);
+  const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), ms);
   try {
     const r = await fetch(u, { method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(s.glass ? { sid: s.callSid, from: s.from, act, glass: true, said: String(s.said || '') } : { sid: s.callSid, from: s.from, act }), redirect: 'follow', signal: ctl.signal });
+      body: wellFormed(JSON.stringify(s.glass ? { sid: s.callSid, from: s.from, act, glass: true, said: String(s.said || '') } : { sid: s.callSid, from: s.from, act })), redirect: 'follow', signal: ctl.signal });
     const txt = await r.text();
     try { return JSON.parse(txt); } catch (e) { return { ok: false, error: 'unreadable: ' + txt.slice(0, 80) }; }
   } finally { clearTimeout(tm); }
+}
+async function postVoiceAct(s, act) {
+  try { return await postVoiceActOnce(s, act, 20000); }
+  catch (e) {
+    const aborted = e && (e.name === 'AbortError' || /abort/i.test(String(e && e.message)));
+    const an = String((act && act.action) || '');
+    if (aborted && ONESHOT_ACTS.test(an)) throw new Error('the office was still working at 20 s - it MAY HAVE COMPLETED');
+    if (!IDEMPOTENT_ACTS.test(an)) throw e;
+    logErr('voiceact.slow', (aborted ? 'aborted at 20 s' : String((e && e.message) || e)) + ' on ' + an + ' - one more try');
+    if (s.ws && !s.glass) { try { sendText(s.ws, 'The office is still saving that. One second.', true); } catch (e2) {} }
+    return await postVoiceActOnce(s, act, 25000);
+  }
 }
 
 // v1.17 THE CUSTOMER LINE'S HANDS (Aggie's own #1, Sept 16 — Pedro Tito: a time
@@ -470,6 +491,43 @@ function gateSpeak(reply, ok, line) {
   return (rest ? (rest + ' ') : '') + L;
 }
 
+// v1.38 THE CLOCK ON THE WALL (owner line, Sept 27 10:20 AM: 'move Saturday's jobs to Sunday' -> she called Sunday 9/27's jobs
+// 'Saturday' and tried to move them to 9/28. The pack's 7-day schedule starts today, so yesterday never appears and she guessed
+// the weekday.) Every call opens with today, yesterday and tomorrow spelled out, from the gateway's own clock, never a cache.
+const TZ = 'America/New_York';
+function dayName(d) { return d.toLocaleDateString('en-US', { timeZone: TZ, weekday: 'long' }); }
+function mdy(d) { return d.toLocaleDateString('en-US', { timeZone: TZ, month: 'numeric', day: 'numeric' }); }
+function clockLine() {
+  const now = new Date();
+  const y = new Date(now.getTime() - 86400000), t = new Date(now.getTime() + 86400000);
+  const tail = []; for (let i = 2; i <= 6; i++) { const d = new Date(now.getTime() + i * 86400000); tail.push(dayName(d).slice(0, 3) + ' ' + mdy(d)); }
+  return 'RIGHT NOW: ' + now.toLocaleDateString('en-US', { timeZone: TZ, weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' }) + ', '
+    + now.toLocaleTimeString('en-US', { timeZone: TZ, hour: 'numeric', minute: '2-digit' }) + ' Eastern. Yesterday was ' + dayName(y) + ' ' + mdy(y)
+    + '. Tomorrow is ' + dayName(t) + ' ' + mdy(t) + '. Then ' + tail.join(', ') + '. A weekday name with no date means the nearest one: '
+    + '"Saturday" today means ' + (dayName(y) === 'Saturday' ? 'yesterday, ' + mdy(y) : 'the coming one') + '. Never guess a weekday from a date; read it here.';
+}
+// v1.38 SPOKEN, NOT PRINTED: the office answers in record form ('2026-09-27 12:00 PM to 5:00 PM (ownerOverride:true if you mean it.)') and
+// the voice read it as 'twenty twenty-six zero nine twenty-seven'. Dates become 'Sunday the 27th', windows become '12 to 5', the override
+// hint becomes a question.
+const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+function ordinal(n) { n = Number(n); const s = ['th','st','nd','rd'], v = n % 100; return n + (s[(v - 20) % 10] || s[v] || s[0]); }
+function spokenDates(t) {
+  return String(t || '')
+    .replace(/\b(\d{4})-(\d{2})-(\d{2})\b/g, (m, y, mo, d) => { const dt = new Date(Number(y), Number(mo) - 1, Number(d), 12); return dayName(dt) + ' ' + MONTHS[Number(mo) - 1] + ' ' + ordinal(d); })
+    .replace(/\b(\d{1,2}):00 ([AP]M) to (\d{1,2}):00 ([AP]M)\b/gi, (m, a, ap, b, bp) => a + (ap.toUpperCase() === bp.toUpperCase() ? '' : ' ' + ap) + ' to ' + b + ' ' + bp)
+    .replace(/\s*\(ownerOverride:true if you mean it\.?\)/i, ' Want me to override that?')
+    .replace(/\s*\u2014\s*/g, ', ').replace(/\s{2,}/g, ' ').trim();
+}
+// v1.38 ONE MOVE PER JOB ON THE OWNER LINE TOO: 'Mari Jo Handbury' came back as 'Marijo Handberry' and the plain key missed it.
+// Names compare by letter bigrams; 0.6 or better is the same person on the same call.
+function nameSim(a, b) {
+  const g = x => { x = String(x || '').toLowerCase().replace(/[^a-z]/g, ''); const o = {}; for (let i = 0; i < x.length - 1; i++) o[x.slice(i, i + 2)] = (o[x.slice(i, i + 2)] || 0) + 1; return o; };
+  const A = g(a), B = g(b); let hit = 0, na = 0, nb = 0;
+  for (const k in A) { na += A[k]; if (B[k]) hit += Math.min(A[k], B[k]); } for (const k in B) nb += B[k];
+  return (na + nb) ? (2 * hit) / (na + nb) : 0;
+}
+const RX_ALREADY = /already (?:there|on)\b|nothing to move/i;
+
 // ---- per-call session -------------------------------------------------------
 const sessions = new Map();   // ws -> session
 let callsHandled = 0;
@@ -483,7 +541,8 @@ function newSession(ws) {
     sched: null, done: false, finalized: false,
     packPromise: null, pack: null, callerPack: null, recStarted: false, mid: '', endWhy: '', needsCallback: false,
     ctl: null,                 // AbortController of the in-flight AI turn
-    actsRan: []                // v1.17: what her hands did on this call (rides to GAS in the results)
+    actsRan: [],               // v1.17: what her hands did on this call (rides to GAS in the results)
+    ownerActs: [], ownerOverride: false   // v1.38 owner-line ledger + his standing 'I mean it' for this call
   };
 }
 
@@ -667,7 +726,7 @@ async function handlePrompt(s, voicePrompt) {
       return doTransfer(s, 'no brain after patience window');
     }
   }
-  const sys = String(pack.sys).replace(/\{\{CALLER_ID\}\}/g, s.from || 'unknown');
+  const sys = clockLine() + '\n\n' + String(pack.sys).replace(/\{\{CALLER_ID\}\}/g, s.from || 'unknown');   // v1.38 the clock first
 
   const glassImg = await maybeGlassPhoto(s, voicePrompt);   // v1.26: did he just send a photo he's now asking about?
   const ctl = new AbortController();
@@ -714,6 +773,26 @@ async function handlePrompt(s, voicePrompt) {
   // loud. Post it to GAS (hook=voiceact, owner-number checked there too),
   // speak the result, and remember it in the convo so the next turn knows.
   if (d.act && d.act.action && isOwner) {
+    // v1.38 ONE MOVE PER JOB, HIS OVERRIDE STANDS FOR THE CALL
+    if (d.act.data && typeof d.act.data === 'object') {
+      const nm = String(d.act.data.client || d.act.data.name || d.act.data.clientName || '');
+      const target = String(d.act.data.newDate || d.act.data.date || '').slice(0, 10);
+      const prior = s.ownerActs.find(x => x.ok && x.action === d.act.action && (!target || x.target === target) && nameSim(x.name, nm) >= 0.6);
+      if (prior && /^(rescheduleJob|voidJob|sendInvoice|chargeCard|tierSignup|createWorkOrder)$/.test(d.act.action)) {
+        const line = 'Already done this call: ' + spokenDates(prior.said).slice(0, 200);
+        logInfo('voiceact ' + d.act.action + ' skipped: already done for ' + nm + ' on ' + s.callSid);
+        s.convo.push({ role: 'assistant', content: '[already done this call: ' + d.act.action + ' for ' + nm.slice(0, 40) + ' - ' + String(prior.said).slice(0, 120) + '. Do not repeat it; say so and move to the next one.]' });
+        if (buffered) { const lead = stripOwnerClaims(stripClaims(d.reply)); sendText(s.ws, (lead ? (lead + ' ') : '') + line, true); } else sendText(s.ws, line, true);
+        spokenThisTurn = true;
+        d.act = null;
+      } else if (d.act.data.ownerOverride === undefined && /^(rescheduleJob|createWorkOrder)$/.test(d.act.action)) {
+        const lastUser = [...s.convo].reverse().find(m => m.role === 'user' && !/^\[/.test(String(m.content || '')));
+        const yes = /\b(yes|yeah|yep|do it|mean it|override|go ahead|always mean it|i said so|just do it)\b/i.test(String((lastUser && lastUser.content) || ''));
+        if (s.ownerOverride || (s.overrideAsked && yes)) { d.act.data.ownerOverride = true; s.ownerOverride = true; }
+      }
+    }
+  }
+  if (d.act && d.act.action && isOwner) {
     try {
       if (buffered && READ_ACTS[d.act.action] && d.reply) { sendText(s.ws, String(d.reply), true); spokenThisTurn = true; }   // v1.29 a read: her lead-in line, then the answer turn below
       const r = await postVoiceAct(s, d.act);
@@ -746,12 +825,35 @@ async function handlePrompt(s, voicePrompt) {
         else sendText(s.ws, 'I pulled it up but lost my train of thought — ask me that once more?', true);
         return;
       }
-      const said = r && r.ok ? String(r.result || 'Done.').replace(/[\u2714\u2716\u2717\u23f3\ud83d\udcc5\u260e]/g, '').trim().slice(0, 240) : ('That did not go through: ' + String((r && r.error) || 'no answer from the office').slice(0, 120));
+      const rawRes = String((r && (r.result || r.error)) || '').replace(/[\u2714\u2716\u2717\u23f3\ud83d\udcc5\u260e]/g, '').trim();
+      // v1.38 'No X job on <day>. Their next job is <target>, already there; nothing to move' IS the job done - by us, earlier this call.
+      const alreadyThere = !!(r && !r.ok && RX_ALREADY.test(rawRes) && /^(rescheduleJob|voidJob)$/.test(d.act.action));
+      const ok = !!(r && r.ok) || alreadyThere;
+      let said = ok ? spokenDates(rawRes || 'Done.').slice(0, 240) : ('That did not go through: ' + spokenDates(rawRes || 'no answer from the office').slice(0, 160));
+      if (alreadyThere) { const mm = /Their next job is ([^()]+?)\s*(?:\(|\u2014|,|$)/.exec(rawRes); const who = String((d.act.data && (d.act.data.client || d.act.data.name || d.act.data.clientName)) || 'That job'); said = who + ' is already on ' + spokenDates(mm ? mm[1].trim() : 'the new day') + '. Done.'; }
+      if (/ownerOverride/i.test(rawRes)) s.overrideAsked = true;   // v1.38 the office asked; his next yes is the override, for the rest of the call
+      const nm0 = String((d.act.data && (d.act.data.client || d.act.data.name || d.act.data.clientName)) || '');
+      s.ownerActs.push({ action: d.act.action, name: nm0, target: String((d.act.data && (d.act.data.newDate || d.act.data.date)) || '').slice(0, 10), ok, said: said.slice(0, 200) });
+      if (ok && d.act.data && d.act.data.ownerOverride) s.ownerOverride = true;
       // v1.29: on a buffered turn her own words come first with any 'done' claim cut out, then the office's verdict
-      if (buffered) { const lead = (r && r.ok) ? stripClaims(d.reply) : stripOwnerClaims(stripClaims(d.reply)); sendText(s.ws, (lead ? (lead + ' ') : '') + said, true); spokenThisTurn = true; }   // v1.33 no 'Done' over a refusal
+      if (buffered) { const lead = ok ? stripClaims(d.reply) : stripOwnerClaims(stripClaims(d.reply)); sendText(s.ws, (lead ? (lead + ' ') : '') + said, true); spokenThisTurn = true; }   // v1.33 no 'Done' over a refusal
       else sendText(s.ws, said, true);
-      s.convo.push({ role: 'assistant', content: '[ran ' + d.act.action + ': ' + said.slice(0, 200) + ']' });
-    } catch (e) { logErr('voiceact', e); sendText(s.ws, 'That action did not go through on my end.', true); }
+      s.convo.push({ role: 'assistant', content: '[' + (ok ? 'ran ' : 'FAILED ') + d.act.action + ': ' + rawRes.slice(0, 200) + (alreadyThere ? ' (that is the move we made earlier this call - done, move on)' : '') + ']' });
+      logInfo('voiceact ' + d.act.action + ' ' + (ok ? 'ok' : 'FAIL') + ' for ' + nm0 + ' on ' + s.callSid + ': ' + rawRes.slice(0, 120));
+    } catch (e) {
+      // v1.38 the failure is spoken ONCE, with her own 'doing it now' words cut, and written into the conversation so she knows.
+      // (Before: the fallback line, then her full 'Starting with Charlie Thomas...' reply on top of it, and no note - so she
+      // stood by 'waiting on the system' for three turns.)
+      logErr('voiceact', e);
+      const why = String((e && e.message) || e).slice(0, 120);
+      const maybe = /MAY HAVE COMPLETED/.test(why);
+      s.convo.push({ role: 'assistant', content: maybe
+        ? '[UNKNOWN ' + d.act.action + ': the office was still working when the line timed out - it may have gone through. Do NOT run it again blind; look it up first (lookup / searchJobs / searchInbox) and tell him what you find.]'
+        : '[FAILED ' + d.act.action + ': the office did not answer (' + why + '). It did NOT run as far as you know. Tell him plainly; offer to try once more.]' });
+      const line = maybe ? 'The office was still working on that when it timed out. Let me check whether it went through before I touch it again.' : 'The office did not answer on that one. Want me to try it again?';
+      if (buffered) sendText(s.ws, gateSpeak(stripOwnerClaims(d.reply), false, line), true); else sendText(s.ws, line, true);
+      spokenThisTurn = true;
+    }
   } else if (!isOwner) {   // v1.30 MISSIONS HAVE HANDS (owner, Sept 25 5:02 AM: 'Fix both those') — an outbound call books/moves/cancels/signs up through the same office door as an inbound one
     // v1.17 THE CUSTOMER LINE'S HANDS. Her act, or the one her words imply,
     // rides to GAS while the caller is still on the line. Whatever GAS hands
@@ -1010,7 +1112,7 @@ async function glassTurn(q, img, mt, auto) {
   glass.at = t0;
   const pack = await glassPackGet();
   if (!pack) return { ok: false, say: 'My brain did not load. Try me again in a few seconds.', brainMs: Date.now() - t0 };
-  const sys = String(pack.sys);
+  const sys = clockLine() + '\n\n' + String(pack.sys);   // v1.38 the clock first
   const text = String(q || '').trim().slice(0, 1500) || 'What am I looking at?';
   const first = img ? [{ type: 'image', source: { type: 'base64', media_type: mt || 'image/jpeg', data: img } },
                        { type: 'text', text: text + (auto ? '\n(A photo of what he is looking at came along automatically with his tap. Use it ONLY if his question is about something he can see; otherwise ignore it and never mention it.)' : '\n(The photo is what he is looking at right now.)') }] : text;
