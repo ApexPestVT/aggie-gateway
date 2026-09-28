@@ -62,7 +62,7 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 
 // ---- config (all via environment; render.yaml wires these) -----------------
-const GW_VERSION = '1.44';
+const GW_VERSION = '1.45';
 const PORT       = process.env.PORT || 10000;
 const ANTHROPIC  = process.env.ANTHROPIC_API_KEY || '';
 const GAS_URL    = (process.env.GAS_EXEC_URL || '').replace(/\/+$/, ''); // full /exec URL, no query
@@ -191,11 +191,11 @@ async function aiTurn(sys, convo, onReplyText, signal, image) {
     // her brain offline. Marking it cacheable means the first turn of a call
     // pays full price and every turn after reads from cache at a tenth the
     // cost. Same prompt, same behaviour, same voice — only the bill changes.
-    body: wellFormed(JSON.stringify({
+    body: wellFormedJson(JSON.stringify(deepWellFormed({
       model: MODEL, max_tokens: MAX_TOKENS,
       system: [{ type: 'text', text: sys, cache_control: { type: 'ephemeral' } }],
       messages, stream: true
-    }))
+    })))   // v1.45 cleaned before serializing, netted after
   });
   if (!r.ok) throw new Error('anthropic ' + r.status + ': ' + (await r.text()).slice(0, 200));
   const feed = replyExtractor(onReplyText);
@@ -391,6 +391,23 @@ function wellFormed(str) {
   if (typeof s.toWellFormed === 'function') return s.toWellFormed();
   return s.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/g, '\uFFFD').replace(/(^|[^\uD800-\uDBFF])([\uDC00-\uDFFF])/g, '$1\uFFFD');
 }
+// v1.45 THE HALF-EMOJI THAT KILLED TWO CALLS (aggie-sim, Sept 28 3:26 PM: Bonnie Hipko and Arlena Taylor - every brain call after the
+// caller file landed came back 'anthropic 400: invalid high surrogate in string' and she said 'let me get Chris' to everything).
+// 1.36's wellFormed() ran on the JSON TEXT - but JSON.stringify had already turned the broken character into the six plain
+// characters \ud83d, which are perfectly well-formed text, so nothing was repaired and the API refused the escape. The strings
+// are cleaned BEFORE they are serialized now (system text, every message, every text block), and the serialized text gets a
+// second net for any escape that slipped through.
+function deepWellFormed(v) {
+  if (typeof v === 'string') return wellFormed(v);
+  if (Array.isArray(v)) return v.map(deepWellFormed);
+  if (v && typeof v === 'object') { const o = {}; for (const k of Object.keys(v)) o[k] = deepWellFormed(v[k]); return o; }
+  return v;
+}
+function wellFormedJson(text) {
+  return String(text || '')
+    .replace(/\\u[dD][89abAB][0-9a-fA-F]{2}(?!\\u[dD][c-fC-F][0-9a-fA-F]{2})/g, '\\ufffd')       // a high escape with no low escape after it
+    .replace(/(^|[^0-9a-fA-F]|(?<!\\u[dD][89abAB][0-9a-fA-F]{2}))(\\u[dD][c-fC-F][0-9a-fA-F]{2})/g, (m, pre, esc, off, str) => (/\\u[dD][89abAB][0-9a-fA-F]{2}$/.test(str.slice(Math.max(0, off - 6), off + pre.length)) ? m : pre + '\\ufffd'));   // a low escape with no high escape before it
+}
 async function postVoiceBook(s, act, _retry) {
   // v1.36 (health log Sept 25: seven bookJob 'This operation was aborted' at 8000 ms). The office's write chain can outrun 8 s on a
   // busy sheet; the kit keeps running after the cut, so the job often DID save. One retry after an abort: the kit answers an
@@ -445,6 +462,7 @@ function synthesizeAct(s, d) {
   if (/\b((?:removed|taken|took) you (?:off|from) (?:our|the) list|you(?:'|’)?re off (?:our|the) list|won(?:'|’)?t (?:hear from|be contacted by) us)\b/i.test(reply)) return { action: 'dncAdd', data: { name: lead.name || '', phone: s.from, reason: lastUser.slice(0, 160), promised: reply.slice(0, 240), callerSaid: lastUser.slice(0, 200) } };   // v1.31
   if (RX_SAID_CONTACT.test(reply) && (lead.address || lead.email)) return { action: 'updateContact', data: { name: lead.name || '', phone: s.from, address: lead.address || '', email: lead.email || '', promised: reply.slice(0, 240), callerSaid: lastUser.slice(0, 200) } };
   if (RX_SAID_SENT.test(reply) && (lead.service || lead.pest)) return { action: 'sendQuote', data: { name: lead.name || '', phone: s.from, service: lead.service || lead.pest || '', promised: reply.slice(0, 240), callerSaid: lastUser.slice(0, 200) } };
+  if (RX_SAID_BOOKED.test(reply) && (lead.day || lead.window)) return { action: 'bookJob', data: { name: lead.name || '', phone: s.from, address: lead.address || '', service: lead.service || lead.pest || '', day: lead.day || '', window: lead.window || '', price: lead.price || '', promised: reply.slice(0, 240), callerSaid: lastUser.slice(0, 200) } };   // v1.45 a booking claim outranks a note (sim: 'I've got you down for Friday morning ... so the tech comes prepared' synthesized a noteJob, the note ran, and the booking claim rode out on it - no job was ever made)
   if (RX_SAID_NOTED.test(reply)) return { action: 'noteJob', data: { name: lead.name || '', phone: s.from, note: (reply.slice(0, 200) + (lastUser ? (' — caller said: “' + lastUser.slice(0, 120) + '”') : '')), promised: reply.slice(0, 240), callerSaid: lastUser.slice(0, 200) } };
   if (RX_SAID_BOOKED.test(reply) && (lead.day || lead.window)) return { action: 'bookJob', data: { name: lead.name || '', phone: s.from, address: lead.address || '', service: lead.service || lead.pest || '', day: lead.day || '', window: lead.window || '', price: lead.price || '', promised: reply.slice(0, 240), callerSaid: lastUser.slice(0, 200) } };
   return null;
@@ -461,10 +479,21 @@ const RX_SAID_CARD = /\b((?:i(?:'|’)?ve |i |just )?(?:sent|texted|emailed) (?:
 const RX_SAID_SENT = /\b((?:i(?:'|’)?ve |i(?:'|’)?ll |i |just )(?:sent|send|emailed|email|texted|text|shot|shoot)(?:ing)? (?:you |that |it |over )?(?:over |along )?(?:the |a |your )?(?:quote|estimate|pricing|proposal|agreement|contract|paperwork|receipt|details|info(?:rmation)?)\b)/i;
 const RX_SAID_CONTACT = /\b((?:i(?:'|’)?ve |i |just )?(?:updated|changed|corrected|fixed|put|saved) (?:your |the )?(?:new )?(?:address|phone|number|email|contact (?:info|information))(?: on file)?)\b/i;
 const RX_SAID_ANY = [RX_SAID_BOOKED, RX_SAID_CANCEL, RX_SAID_MOVED, RX_SAID_NOTED, RX_SAID_CONFIRMED, RX_SAID_CARD, RX_SAID_SENT, RX_SAID_CONTACT];   // v1.29 1b: + sent / contact
-function saidClaims(reply) { const r = String(reply || ''); return RX_SAID_ANY.some(rx => rx.test(r)); }
+const RX_DESCRIBES = /\b(already|currently|still)\b/i;   // v1.45 'you're already on the books for Wednesday' describes the file; it promises nothing
+function saidClaims(reply) { return String(reply || '').split(/(?<=[.!?])\s+/).some(x => !RX_DESCRIBES.test(x) && RX_SAID_ANY.some(rx => rx.test(x))); }
+// v1.45 a claim is BACKED when an act of that kind already succeeded on this call - a recap of the truth is not a promise
+const CLAIM_BACKERS = [[RX_SAID_BOOKED, /^(bookJob|rescheduleJob|confirmJob)$/], [RX_SAID_CANCEL, /^cancelJob$/], [RX_SAID_MOVED, /^rescheduleJob$/], [RX_SAID_NOTED, /^(noteJob|bookJob)$/], [RX_SAID_CONFIRMED, /^(confirmJob|bookJob)$/], [RX_SAID_CARD, /^(cardLink|tierSignup)$/], [RX_SAID_SENT, /^sendQuote$/], [RX_SAID_CONTACT, /^updateContact$/]];
+function stripUnbacked(s, reply) {   // v1.45 keep every sentence except a claim no act on this call backs
+  return String(reply || '').split(/(?<=[.!?])\s+/).filter(x => RX_DESCRIBES.test(x) || !RX_SAID_ANY.some(rx => rx.test(x)) || CLAIM_BACKERS.some(([rx, acts]) => rx.test(x) && s.actsRan.some(a => a.ok && acts.test(a.action)))).join(' ').replace(/\s+/g, ' ').trim();
+}
+function claimsBacked(s, reply) {
+  const sents = String(reply || '').split(/(?<=[.!?])\s+/).filter(x => !RX_DESCRIBES.test(x) && RX_SAID_ANY.some(rx => rx.test(x)));
+  if (!sents.length) return true;
+  return sents.every(x => CLAIM_BACKERS.some(([rx, acts]) => rx.test(x) && s.actsRan.some(a => a.ok && acts.test(a.action))));
+}
 function stripClaims(reply) {
   const sents = String(reply || '').split(/(?<=[.!?])\s+/);
-  const kept = sents.filter(x => !RX_SAID_ANY.some(rx => rx.test(x)));
+  const kept = sents.filter(x => RX_DESCRIBES.test(x) || !RX_SAID_ANY.some(rx => rx.test(x)));   // v1.45 a description of the file stays
   return kept.join(' ').replace(/\s+/g, ' ').trim();
 }
 // what she says once the office has answered: her own words when they came true, the office's line when they did not
@@ -494,15 +523,15 @@ function stripTransferLine(reply) { return String(reply || '').replace(RX_TRANSF
 // v1.35 THE HAND-OFF RULE ON THE PHONE (owner, Sept 25: 'I do not want to talk to a client unless strictly necessary'). A customer
 // sentence that hands them to Chris is removed unless the call is commercial or the sentence is about money; a scheduling hand-off
 // becomes the booking question. Missions and the owner line are untouched.
-const RX_HANDOFF = /\b(?:chris|he)(?:'|’)?(?:ll| will) (?:call|ring|get back to|reach out(?: to)?|follow up(?: with)?|confirm|text|send|be in touch|get in touch|contact|take care of|go over|look at|walk you through)\b|\bi(?:'|’)?(?:ll| will) have chris\b|\bhave chris (?:call|confirm|reach|get back|follow|text|send|look|contact)\b|\bi(?:'|’)?(?:ll| will) (?:pass|send|flag) (?:this|that|it) (?:along )?to chris\b/i;
-const RX_HANDOFF_OK = /\b(refund|charg|bill|invoice|discount|price|pricing|quote|cost|pay|payment|card|commercial|business|restaurant|property manag|building|termite|bat|contract|estimate|dispute|credit)/i;
+const RX_HANDOFF = /\b(?:chris|he)(?:'|’)?(?:ll| will) (?:call|ring|get back to|reach out(?: to)?|follow up(?: with)?|confirm|text|send|be in touch|get in touch|contact|take care of|go over|look at|walk you through)\b|\bi(?:'|’)?(?:ll| will) have chris\b|\bhave chris (?:call|confirm|reach|get back|follow|text|send|look|contact)\b|\b(?:let me |i(?:'|’)?(?:ll| will) )?(?:pass|send|flag)(?:ing)? (?:this|that|it|along)[^.!?]{0,40}?\b(?:to|for) chris\b|\bmake sure chris knows\b|\bnoted? for chris to\b|\bfor chris to (?:call|text|reach|confirm|sort)\b|\bget chris for you\b/i;   // v1.45 + 'flag this for Chris to sort out', 'pass along your request for Chris to call you', 'make sure Chris knows', 'noted for Chris to call' (sim, Sept 28)
+const RX_HANDOFF_OK = /\b(refund|charged twice|double.?charg|overcharg|bill(?:ing|ed|s)?\b|invoice|commercial|business|restaurant|property manag|building|termite|\bbats?\b|contract|estimate|dispute|credit)/i;   // v1.45 'pricing', 'quote', 'card', 'payment' dropped: she quotes the Canon and sends the card link herself (sim: 'flag this for Chris ... so you get the right pricing' rode out on the word pricing)
 const ASK_DAY = 'Just so I lock it in right — which day works best for you, morning or afternoon?';
-function stripHandoff(reply) {
+function stripHandoff(reply, haveDay) {
   let asked = false, cut = 0;
   const out = String(reply || '').split(/(?<=[.!?])\s+/).map(x => {
     if (!RX_HANDOFF.test(x) || RX_HANDOFF_OK.test(x)) return x;
     cut++;
-    if (/\b(time|day|date|schedul|appointment|visit|book|window|come out|when)\b/i.test(x) && !asked) { asked = true; return ASK_DAY; }
+    if (!haveDay && /\b(time|day|date|schedul|appointment|visit|book|window|come out|when)\b/i.test(x) && !asked) { asked = true; return ASK_DAY; }   // v1.45 never re-ask the day once it is known
     return '';
   }).filter(Boolean).join(' ').trim();
   return { text: out || (cut ? 'Is there anything else I can take care of for you right now?' : String(reply || '')), cut };
@@ -549,7 +578,7 @@ function nameSim(a, b) {
   const g = x => { x = String(x || '').toLowerCase().replace(/[^a-z]/g, ''); const o = {}; for (let i = 0; i < x.length - 1; i++) o[x.slice(i, i + 2)] = (o[x.slice(i, i + 2)] || 0) + 1; return o; };
   const A = g(a), B = g(b); let hit = 0, na = 0, nb = 0;
   for (const k in A) { na += A[k]; if (B[k]) hit += Math.min(A[k], B[k]); } for (const k in B) nb += B[k];
-  return (na + nb) ? (2 * hit) / (na + nb) : 0;
+  return (na + nb) ? (2 * hit) / (na + nb) : 1;   // v1.45 two blank names are the same (blank) name - a day-level act (sendConfirmations) carries no customer and was never deduped (sim, Sept 28 6:33 PM: texts sent twice)
 }
 const RX_ALREADY = /already (?:there|on)\b|nothing to move/i;
 
@@ -567,7 +596,8 @@ function newSession(ws) {
     packPromise: null, pack: null, callerPack: null, recStarted: false, mid: '', endWhy: '', needsCallback: false,
     ctl: null,                 // AbortController of the in-flight AI turn
     actsRan: [],               // v1.17: what her hands did on this call (rides to GAS in the results)
-    ownerActs: [], ownerOverride: false   // v1.38 owner-line ledger + his standing 'I mean it' for this call
+    ownerActs: [], ownerOverride: false,   // v1.38 owner-line ledger + his standing 'I mean it' for this call
+    turnSeq: 0, chain: Promise.resolve()   // v1.45 one turn at a time per call (see handlePrompt)
   };
 }
 
@@ -662,11 +692,25 @@ async function maybeGlassPhoto(s, text) {
     return img;
   } catch (e) { logErr('glass.maybePhoto', e); return null; }
 }
+// v1.45 ONE TURN AT A TIME (aggie-sim, Sept 28 2:44 PM run: the owner's PIN turn was still waiting for his pack when
+// 'move every work order on Wednesday to Thursday' arrived; both turns woke on the pack, both asked the brain, both ran
+// moveDay - 'On it. On it. Moved 4 of 4... Moved 4 of 4...' - a DOUBLE WRITE. The same overlap on a customer line is
+// 'Aggie? Hello?' while the office is still booking: a second brain turn with no record of the first.) Turns now run in
+// sequence per call. An utterance that arrives while an older turn is still waiting for the pack makes that older turn
+// stale - the newer one carries both sentences in the conversation. An older turn already past the brain (its act in the
+// office) finishes and speaks first; the newer utterance is answered right after, with the result on record.
 async function handlePrompt(s, voicePrompt) {
   // a new utterance always cancels a stale in-flight turn (barge-in via speech)
   if (s.ctl) { try { s.ctl.abort(); } catch (e) {} }
   s.convo.push({ role: 'user', content: String(voicePrompt).slice(0, 500) });
   maxListen(s, voicePrompt);   // v1.16 shadow ears - logs only unless MAX_LIVE=1
+  const seq = ++s.turnSeq;
+  const run = () => runTurn(s, voicePrompt, seq).catch(e => logErr('runTurn', e));
+  s.chain = s.chain.then(run, run);
+  return s.chain;
+}
+async function runTurn(s, voicePrompt, seq) {
+  if (seq !== s.turnSeq) { logInfo('turn ' + seq + ' skipped on ' + s.callSid + ' - a newer utterance carries it'); return; }   // v1.45 superseded while queued
 
   // v1.1 brain choice, EVERY turn: the caller-specific pack (their dossier
   // inside) wins the moment it lands — even mid-call. First turn races it
@@ -736,6 +780,7 @@ async function handlePrompt(s, voicePrompt) {
       if (!s.callerPack && first) logErr('pack.late', 'caller pack not here after 3s for ' + s.callSid + ' — first turn runs generic, file swaps in when it lands');
     }
   }
+  if (seq !== s.turnSeq) { logInfo('turn ' + seq + ' skipped after the pack wait on ' + s.callSid + ' - a newer utterance carries it'); return; }   // v1.45
   let pack = s.callerPack || genericPack;
   if (!pack) {
     // v1.1 COLD-START PATIENCE: a fresh boot compiles the generic brain in the
@@ -752,7 +797,7 @@ async function handlePrompt(s, voicePrompt) {
     }
   }
   const ownerLaw = (s.callerPack && s.callerPack.owner === true)
-    ? '\nOWNER BATCH LAW (v1.42): "move everything on <day> to <day>" is ONE act: moveDay {fromDate, newDate, window?, ownerOverride?}; "send confirmations to the rest / to the unconfirmed" is ONE act: sendConfirmations {date, names?, skip?}; "mark X confirmed" is updateWorkOrderStatus {client, date?, status:"Confirmed"} - you CAN change a status; "terminate service / close the account" is terminateService {client}. Reply "On it." and emit the act in the SAME turn; never do a batch one item at a time, never ask which jobs or whether to start, never say a thing must be done in the app when one of these acts does it. When he says yes to any batch, that yes covers every item - no per-item asking, no re-announcing a finished item, one short line per result. If the office reports nothing on a day he can see jobs on, your schedule is stale: say so and look it up (searchJobs) before contradicting him.\n'
+    ? '\nOWNER BATCH LAW (v1.42): "move everything on <day> to <day>" is ONE act: moveDay {fromDate, newDate, window?, ownerOverride?}; "send confirmations to the rest / to the unconfirmed" is ONE act: sendConfirmations {date, names?, skip?}; "mark X confirmed" is updateWorkOrderStatus {client, date?, status:"Confirmed"} - you CAN change a status; "terminate service / close the account" is terminateService {client}. Reply "On it." and emit the act in the SAME turn; never do a batch one item at a time, never ask which jobs or whether to start, never say a thing must be done in the app when one of these acts does it. When he says yes to any batch, that yes covers every item - no per-item asking, no re-announcing a finished item, one short line per result. If the office reports nothing on a day he can see jobs on, your schedule is stale: say so and look it up (searchJobs) before contradicting him. "Will you / can you send confirmations to the unconfirmed?" is the order itself - run it, do not ask "want me to?" first.\n'
     : '';
   const sys = clockLine() + ownerLaw + '\n\n' + String(pack.sys).replace(/\{\{CALLER_ID\}\}/g, s.from || 'unknown');   // v1.38 the clock first · v1.39 the batch law
 
@@ -762,16 +807,40 @@ async function handlePrompt(s, voicePrompt) {
   let spoke = false;
   let raw = '';
   const buffered = true;   // v1.29: every turn waits for the hands; 1b: missions too — they have no hands, so a claim on a mission call is cut, never spoken
+  // v1.45 NO SILENT FIRST TURN (sim: 6-9 s from the caller's first sentence to her first word on every call - the brain's first
+  // pass over a 35k-character prompt). A customer line that has heard nothing 4 s in gets one short human line; her answer follows.
+  const isOwnerLine = !!(s.callerPack && s.callerPack.owner === true);
+  const sinceHeard = Date.now() - Number((s.ws && s.ws._turnT0) || Date.now());   // the pack wait on a first turn already spent some of the caller's patience
+  const lastHeard = String(voicePrompt || '').trim();
+  const goodbye = lastHeard.split(/\s+/).length <= 6 && /\b(bye|goodbye|thanks?|thank you|that(?:'|’)?s (?:it|all)|okay|ok)\b/i.test(lastHeard);   // v1.45 no 'One sec.' before a goodbye
+  const filler = (!isOwnerLine && !s.mid && !goodbye) ? setTimeout(() => { try { sendText(s.ws, s.convo.length <= 1 ? 'Sure — let me take a look.' : 'One sec.', true); } catch (e) {} }, Math.max(1200, 5000 - sinceHeard)) : null;   // 5 s from when the caller stopped talking: a normal cached turn answers in 2-4 s
   try {
-    raw = await aiTurn(sys, s.convo, tok => { if (buffered) return; spoke = true; sendText(s.ws, tok, false); }, ctl.signal, glassImg);
+    try {
+      raw = await aiTurn(sys, s.convo, tok => { if (buffered) return; spoke = true; sendText(s.ws, tok, false); }, ctl.signal, glassImg);
+    } catch (e1) {
+      if (ctl.signal.aborted) return;
+      // v1.45 ONE RETRY BEFORE ANY TRANSFER (sim: two of six calls went to 'I hit a snag on my end - one moment while I get Chris'
+      // on a single failed brain call, and every turn after it repeated the line). A failed call is logged in full and tried once more.
+      logErr('aiTurn', e1);
+      await new Promise(r => setTimeout(r, 1200));
+      raw = await aiTurn(sys, s.convo, tok => { if (buffered) return; spoke = true; sendText(s.ws, tok, false); }, ctl.signal, glassImg);
+    }
   } catch (e) {
     if (ctl.signal.aborted) return;    // superseded by a newer utterance — say nothing
-    logErr('aiTurn', e);
-    sendText(s.ws, 'Sorry, I hit a snag on my end — one moment while I get Chris for you.', true);
-    return doTransfer(s, 'AI turn failed');
-  } finally { if (s.ctl === ctl) s.ctl = null; }
+    logErr('aiTurn.retry', e);
+    if (filler) clearTimeout(filler);
+    if (isOwnerLine) { sendText(s.ws, 'Chris, my brain call failed twice just now - ' + String((e && e.message) || e).replace(/[{}"]/g, '').slice(0, 120) + '. Say that again in a second.', true); return; }
+    sendText(s.ws, 'Let me get Chris on the line for you.', true);
+    return doTransfer(s, 'AI turn failed twice: ' + String((e && e.message) || e).slice(0, 160));
+  } finally { if (filler) clearTimeout(filler); if (s.ctl === ctl) s.ctl = null; }
 
   const d = parseTurn(raw);
+  if (d && !d.reply && d.done) {   // v1.45 the brain says the call is over and has nothing left to say (sim: 'Sorry, say that one more time?' eight times after 'bye')
+    s.done = true; s.endWhy = 'completed';
+    sendText(s.ws, s.actsRan.some(a => a.ok) ? 'Thanks for calling Apex — bye now!' : '', true);
+    setTimeout(async () => { try { await twilioUpdateCall(s.callSid, '<Response><Hangup/></Response>'); } catch (e) { logErr('hangup', e); } }, 4000);
+    return;
+  }
   if (!d || !d.reply) {
     logErr('parse', 'unparseable: ' + raw.slice(0, 160));
     if (!spoke) sendText(s.ws, 'Sorry, say that one more time for me?', true);
@@ -794,7 +863,7 @@ async function handlePrompt(s, voicePrompt) {
   let spokenThisTurn = false;   // v1.29: buffered turns speak exactly once, below, after the office has answered
   if (!isOwner && !s.mid && d.commercial && !s.commercial) logInfo('handoff strip: turn marked commercial by the brain on ' + s.callSid + ' — ignored, the pack did not say so');   // v1.43
   if (!isOwner && !s.mid && !s.commercial) {   // v1.35 the hand-off rule · v1.43 the brain's own per-turn 'commercial' flag no longer switches it off (Patty, 10:15 AM: 'I'll have Chris confirm the time with you' went out)
-    const h = stripHandoff(d.reply);
+    const h = stripHandoff(d.reply, !!((s.lead && s.lead.day) || s.actsRan.some(a => a.ok && /^(bookJob|rescheduleJob|confirmJob)$/.test(a.action))));   // v1.45
     if (h.cut) { logInfo('handoff removed on ' + s.callSid + ': "' + String(d.reply).slice(0, 120) + '" -> "' + h.text.slice(0, 80) + '"'); d.reply = h.text; s.convo[s.convo.length - 1].content = String(d.reply).slice(0, 500); }
   }
   // v1.9 THE OWNER LINE. When the pack said owner:true, the brain is AGI and a
@@ -804,7 +873,7 @@ async function handlePrompt(s, voicePrompt) {
   if (d.act && d.act.action && isOwner) {
     // v1.38 ONE MOVE PER JOB, HIS OVERRIDE STANDS FOR THE CALL
     if (d.act.data && typeof d.act.data === 'object') {
-      const nm = String(d.act.data.client || d.act.data.name || d.act.data.clientName || (d.act.action === 'moveDay' ? ('day ' + String(d.act.data.fromDate || d.act.data.from || d.act.data.date || '')) : ''));
+      const nm = String(d.act.data.client || d.act.data.name || d.act.data.clientName || (/^(moveDay|sendConfirmations)$/.test(d.act.action) ? ('day ' + String(d.act.data.fromDate || d.act.data.from || d.act.data.date || 'today')) : ''));   // v1.45 sendConfirmations keyed by its day too
       const target = String(d.act.data.newDate || d.act.data.date || '').slice(0, 10) + (d.act.action === 'setPrice' ? '|$' + String(d.act.data.price || '') : (d.act.action === 'updateWorkOrderStatus' ? '|' + String(d.act.data.status || '') : ''));   // v1.42 a new price or status is a new act
       const prior = s.ownerActs.find(x => x.ok && x.action === d.act.action && (!target || x.target === target) && nameSim(x.name, nm) >= 0.6 && !(d.act.data.ownerOverride && !x.override));   // v1.41 an override re-fire is a new act
       if (prior && /^(rescheduleJob|moveDay|voidJob|sendInvoice|chargeCard|tierSignup|createWorkOrder|setPrice|updateWorkOrderStatus|terminateService|sendConfirmations)$/.test(d.act.action)) {
@@ -864,7 +933,7 @@ async function handlePrompt(s, voicePrompt) {
       let said = ok ? spokenDates(rawRes || 'Done.').slice(0, 240) : (refused ? spokenDates(rawRes).slice(0, 300) : ('That did not go through: ' + spokenDates(rawRes || 'no answer from the office').slice(0, 160)));
       if (alreadyThere) { const mm = /Their next job is ([^()]+?)\s*(?:\(|\u2014|,|$)/.exec(rawRes); const who = String((d.act.data && (d.act.data.client || d.act.data.name || d.act.data.clientName)) || 'That job'); said = who + ' is already on ' + spokenDates(mm ? mm[1].trim() : 'the new day') + '. Done.'; }
       if (/ownerOverride/i.test(rawRes)) s.overrideAsked = true;   // v1.38 the office asked; his next yes is the override, for the rest of the call
-      const nm0 = String((d.act.data && (d.act.data.client || d.act.data.name || d.act.data.clientName || (d.act.action === 'moveDay' ? ('day ' + String(d.act.data.fromDate || d.act.data.from || d.act.data.date || '')) : ''))) || '');
+      const nm0 = String((d.act.data && (d.act.data.client || d.act.data.name || d.act.data.clientName || (/^(moveDay|sendConfirmations)$/.test(d.act.action) ? ('day ' + String(d.act.data.fromDate || d.act.data.from || d.act.data.date || 'today')) : ''))) || '');   // v1.45
       s.ownerActs.push({ action: d.act.action, name: nm0, target: String((d.act.data && (d.act.data.newDate || d.act.data.date)) || '').slice(0, 10) + (d.act.action === 'setPrice' ? '|$' + String((d.act.data && d.act.data.price) || '') : (d.act.action === 'updateWorkOrderStatus' ? '|' + String((d.act.data && d.act.data.status) || '') : '')), ok, said: said.slice(0, 200), override: !!(d.act.data && d.act.data.ownerOverride) });
       if (ok && d.act.data && d.act.data.ownerOverride) s.ownerOverride = true;
       // v1.29: on a buffered turn her own words come first with any 'done' claim cut out, then the office's verdict
@@ -943,7 +1012,7 @@ async function handlePrompt(s, voicePrompt) {
         if (buffered) { hb.push(setTimeout(() => { try { sendText(s.ws, 'One moment while I check on that.', true); } catch (e) {} }, 3000)); hb.push(setTimeout(() => { try { sendText(s.ws, 'Still with you — just a few more seconds.', true); } catch (e) {} }, 10000)); }
         let r; try { r = await postVoiceBook(s, act); } finally { hb.forEach(clearTimeout); }
         let line = String((r && r.say) || FALLBACK_SAY).slice(0, 240);
-        if (!s.commercial) { const hs = stripHandoff(line); if (hs.cut) { logInfo('handoff removed from office line on ' + s.callSid + ': "' + line.slice(0, 80) + '"'); line = hs.text || FALLBACK_SAY; } }   // v1.43 the office's own fallback table is not exempt
+        if (!s.commercial) { const hs = stripHandoff(line, true); if (hs.cut) { logInfo('handoff removed from office line on ' + s.callSid + ': "' + line.slice(0, 80) + '"'); line = hs.text || FALLBACK_SAY; } }   // v1.43 the office's own fallback table is not exempt
         const ok = !!(r && r.ok);
         s.actsRan.push({ action: act.action, ok, woId: (r && r.woId) || '', synthesized, error: (r && r.error) || '', key: actKey(act) });   // v1.37 key
         if (buffered) {
@@ -952,6 +1021,7 @@ async function handlePrompt(s, voicePrompt) {
           let say;
           if (ok) say = (r && r.recap) ? String(d.reply) : (synthesized ? String(d.reply) : (String(d.reply) + (line && !saidClaims(d.reply) ? (' ' + line) : '')));
           else say = gateSpeak(d.reply, false, line);
+          if (ok && !claimsBacked(s, say)) { const kept = stripUnbacked(s, say); logInfo('claim cut after ' + act.action + ' on ' + s.callSid + ': "' + say.slice(0, 100) + '" -> "' + kept.slice(0, 80) + '"'); say = kept || line || FALLBACK_SAY; }   // v1.45 the act that ran backs ITS claim only; a booking claim on a note turn is still cut
           say = tidyPromises(say, ok ? String((r && r.window) || '').toLowerCase() : '');   // v1.31 no clock on a callback; the window, not a clock, on a window job
           sendText(s.ws, say.slice(0, 600), true); spokenThisTurn = true;
           if (!ok) logInfo('gate-held ' + act.action + ' on ' + s.callSid + ': "' + String(d.reply).slice(0, 100) + '" -> "' + line.slice(0, 80) + '"');
@@ -963,8 +1033,10 @@ async function handlePrompt(s, voicePrompt) {
         s.convo.push({ role: 'assistant', content: '[' + (ok ? 'ran ' : 'FAILED ') + act.action + (synthesized ? ' (from my own words)' : '') + ': ' + (ok ? line : String((r && r.error) || 'no answer')).slice(0, 200) + ']' });
         logInfo('voicebook ' + act.action + (synthesized ? ' (synth)' : '') + ' ' + (ok ? 'ok ' + ((r && r.woId) || '') : 'FAIL ' + ((r && r.error) || '')) + ' on ' + s.callSid);
       } catch (e) { logErr('voicebook', e); sendText(s.ws, buffered ? gateSpeak(d.reply, false, FALLBACK_SAY) : FALLBACK_SAY, true); spokenThisTurn = true; }
-    } else if (buffered && saidClaims(d.reply)) {
+    } else if (buffered && saidClaims(d.reply) && !claimsBacked(s, d.reply)) {
       // v1.29 no act could be built (no day, no window, nothing to move) yet her words claim a record changed: cut the claim, say the honest line
+      // v1.45 unless the record already landed this call (sim: every 'you're all set for Tuesday' recap AFTER a good booking was cut and
+      // replaced with 'One moment while I check on that.' - five times in one call; the goodbye came out as a filler)
       const say = tidyPromises(gateSpeak(d.reply, false, FALLBACK_SAY), '');
       sendText(s.ws, say.slice(0, 600), true); spokenThisTurn = true;
       logInfo('gate-held (no act) on ' + s.callSid + ': "' + String(d.reply).slice(0, 120) + '"');
@@ -973,7 +1045,7 @@ async function handlePrompt(s, voicePrompt) {
   }
   if (buffered && !spokenThisTurn) sendText(s.ws, isOwner ? String(d.reply) : tidyPromises(d.reply, ''), true);   // v1.29 nothing to check on this turn — speak her words (v1.31: minus any callback clock)
   if (d.flagOwner) s.flag = true;
-  if (d.commercial) s.commercial = true;
+  if (d.commercial && (s.callerPack && s.callerPack.commercial)) s.commercial = true;   // v1.45 the 1.43 rule made whole: only a pack that says commercial latches it (this line was still latching the brain's own flag for every later turn)
   if (d.tierOffered) s.tierOffered = true;
   if (d.tierTaken) s.tierTaken = String(d.tierTaken);
   if (d.sched && d.sched.action) s.sched = d.sched;
