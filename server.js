@@ -62,7 +62,7 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 
 // ---- config (all via environment; render.yaml wires these) -----------------
-const GW_VERSION = '1.40';
+const GW_VERSION = '1.42';
 const PORT       = process.env.PORT || 10000;
 const ANTHROPIC  = process.env.ANTHROPIC_API_KEY || '';
 const GAS_URL    = (process.env.GAS_EXEC_URL || '').replace(/\/+$/, ''); // full /exec URL, no query
@@ -329,8 +329,8 @@ async function postResults(payload) {
 // second answer ('already there' or the move itself) is the truth either way. Reads and refusals answer fast and never reach the retry.
 // Only acts that are safe to run twice get the second try. A text, a charge, an invoice, a new record or a sign-up is NOT retried:
 // if the first one landed after the cut, a retry would send or charge twice - she is told it may have gone through and to look first.
-const IDEMPOTENT_ACTS = /^(rescheduleJob|moveDay|voidJob|updateLead|updateClient|checklistDone|obligationClose|dutyDone|cancelCall|cancelText|forgetMemory|inboxArchive)$/;   // v1.40 + moveDay (a second run finds the day empty and says so)
-const LONG_ACTS = { moveDay: 1 };   // v1.40 a whole day is several saves; give it 90 s, then one 60 s retry
+const IDEMPOTENT_ACTS = /^(rescheduleJob|moveDay|voidJob|updateLead|updateClient|updateWorkOrderStatus|setPrice|noteJob|terminateService|sendConfirmations|checklistDone|obligationClose|dutyDone|cancelCall|cancelText|forgetMemory|inboxArchive)$/;   // v1.42 + setPrice / status / note / terminate / sendConfirmations (Sept 28 6:51 AM: Sandy Ferguson's $0 landed twice and she told him it hadn't)   // v1.40 + moveDay (a second run finds the day empty and says so)
+const LONG_ACTS = { moveDay: 1, sendConfirmations: 1, terminateService: 1 };   // v1.42   // v1.40 a whole day is several saves; give it 90 s, then one 60 s retry
 const ONESHOT_ACTS = /^(createWorkOrder|createLead|sendInvoice|chargeCard|tierSignup|smsReply|scheduleText|scheduleCall|checklistAdd|routeBuild|emailReply|rememberThis)$/;
 // v1.39 A FRESH WIRE EVERY TIME (Sept 27 11:59 AM: Blake Gintof's move reached the office in 9 s; Jim Burrows' three posts over the
 // next three minutes NEVER arrived - no ledger row, no error row, nothing, while the gateway waited 45 s each and gave up. Same shape
@@ -536,7 +536,8 @@ function spokenDates(t) {
     .replace(/\b(\d{4})-(\d{2})-(\d{2})\b/g, (m, y, mo, d) => { const dt = new Date(Number(y), Number(mo) - 1, Number(d), 12); return dayName(dt) + ' ' + MONTHS[Number(mo) - 1] + ' ' + ordinal(d); })
     .replace(/\b(\d{1,2}):00 ([AP]M) to (\d{1,2}):00 ([AP]M)\b/gi, (m, a, ap, b, bp) => a + (ap.toUpperCase() === bp.toUpperCase() ? '' : ' ' + ap) + ' to ' + b + ' ' + bp)
     .replace(/\b0?(\d{1,2}):00\s*[-\u2013]\s*0?(\d{1,2}):00\b/g, (m, a, b) => { const A = Number(a), B = Number(b); const h = x => (x === 12 ? '12' : (x > 12 ? String(x - 12) : String(x))); return h(A) + ' to ' + h(B) + (B >= 12 ? ' PM' : ' AM'); })   // v1.39 '08:00-12:00' -> '8 to 12 PM'
-    .replace(/\s*\(ownerOverride:true if you mean it\.?\)/i, ' Want me to override that?')
+    .replace(/\s*\(ownerOverride:true if you mean it\.?\)/i, ' Say the word and I will override it.')
+    .replace(/\s*\|\s*/g, '. ').replace(/(\d+) held\b/g, '$1 held')
     .replace(/\s*\u2014\s*/g, ', ').replace(/\s{2,}/g, ' ').trim();
 }
 // v1.38 ONE MOVE PER JOB ON THE OWNER LINE TOO: 'Mari Jo Handbury' came back as 'Marijo Handberry' and the plain key missed it.
@@ -748,7 +749,7 @@ async function handlePrompt(s, voicePrompt) {
     }
   }
   const ownerLaw = (s.callerPack && s.callerPack.owner === true)
-    ? '\nOWNER BATCH LAW (v1.40): "move everything on <day> to <day>" is ONE act: moveDay {fromDate, newDate, window?, ownerOverride?} - reply "On it." and emit it in the SAME turn; never move a whole day one job at a time, never ask which jobs or whether to start. When he says yes to any batch, that yes covers every item - no per-item asking, no re-announcing a finished item, one short line per result. If the office reports nothing on a day he can see jobs on, your schedule is stale: say so and look it up (searchJobs) before contradicting him.\n'
+    ? '\nOWNER BATCH LAW (v1.42): "move everything on <day> to <day>" is ONE act: moveDay {fromDate, newDate, window?, ownerOverride?}; "send confirmations to the rest / to the unconfirmed" is ONE act: sendConfirmations {date, names?, skip?}; "mark X confirmed" is updateWorkOrderStatus {client, date?, status:"Confirmed"} - you CAN change a status; "terminate service / close the account" is terminateService {client}. Reply "On it." and emit the act in the SAME turn; never do a batch one item at a time, never ask which jobs or whether to start, never say a thing must be done in the app when one of these acts does it. When he says yes to any batch, that yes covers every item - no per-item asking, no re-announcing a finished item, one short line per result. If the office reports nothing on a day he can see jobs on, your schedule is stale: say so and look it up (searchJobs) before contradicting him.\n'
     : '';
   const sys = clockLine() + ownerLaw + '\n\n' + String(pack.sys).replace(/\{\{CALLER_ID\}\}/g, s.from || 'unknown');   // v1.38 the clock first · v1.39 the batch law
 
@@ -800,9 +801,9 @@ async function handlePrompt(s, voicePrompt) {
     // v1.38 ONE MOVE PER JOB, HIS OVERRIDE STANDS FOR THE CALL
     if (d.act.data && typeof d.act.data === 'object') {
       const nm = String(d.act.data.client || d.act.data.name || d.act.data.clientName || (d.act.action === 'moveDay' ? ('day ' + String(d.act.data.fromDate || d.act.data.from || d.act.data.date || '')) : ''));
-      const target = String(d.act.data.newDate || d.act.data.date || '').slice(0, 10);
-      const prior = s.ownerActs.find(x => x.ok && x.action === d.act.action && (!target || x.target === target) && nameSim(x.name, nm) >= 0.6);
-      if (prior && /^(rescheduleJob|moveDay|voidJob|sendInvoice|chargeCard|tierSignup|createWorkOrder)$/.test(d.act.action)) {
+      const target = String(d.act.data.newDate || d.act.data.date || '').slice(0, 10) + (d.act.action === 'setPrice' ? '|$' + String(d.act.data.price || '') : (d.act.action === 'updateWorkOrderStatus' ? '|' + String(d.act.data.status || '') : ''));   // v1.42 a new price or status is a new act
+      const prior = s.ownerActs.find(x => x.ok && x.action === d.act.action && (!target || x.target === target) && nameSim(x.name, nm) >= 0.6 && !(d.act.data.ownerOverride && !x.override));   // v1.41 an override re-fire is a new act
+      if (prior && /^(rescheduleJob|moveDay|voidJob|sendInvoice|chargeCard|tierSignup|createWorkOrder|setPrice|updateWorkOrderStatus|terminateService|sendConfirmations)$/.test(d.act.action)) {
         const line = nm.split(' ')[0] + ' is already done - ' + spokenDates(String(prior.said).split(/(?<=\.)\s/)[0]).replace(/^Moved\s+\S+\s+\S+\s*(\([^)]*\))?\s*/i, 'moved ').slice(0, 140) + ' Next?';   // v1.39 one short line, not her whole recap again
         logInfo('voiceact ' + d.act.action + ' skipped: already done for ' + nm + ' on ' + s.callSid);
         s.convo.push({ role: 'assistant', content: '[already done this call: ' + d.act.action + ' for ' + nm.slice(0, 40) + ' - ' + String(prior.said).slice(0, 120) + '. Do not repeat it; say so and move to the next one.]' });
@@ -853,13 +854,14 @@ async function handlePrompt(s, voicePrompt) {
       }
       const rawRes = String((r && (r.result || r.error)) || '').replace(/[\u2714\u2716\u2717\u23f3\ud83d\udcc5\u260e]/g, '').trim();
       // v1.38 'No X job on <day>. Their next job is <target>, already there; nothing to move' IS the job done - by us, earlier this call.
-      const alreadyThere = !!(r && !r.ok && RX_ALREADY.test(rawRes) && /^(rescheduleJob|voidJob)$/.test(d.act.action));
-      const ok = !!(r && r.ok) || alreadyThere;
-      let said = ok ? spokenDates(rawRes || 'Done.').slice(0, 240) : ('That did not go through: ' + spokenDates(rawRes || 'no answer from the office').slice(0, 160));
+      const refused = /^\s*[\u2716\u2717]/.test(String((r && r.result) || ''));   // v1.41 the office's own ✖/✗ is a refusal even when its ok flag says true (Sept 27 9:16 PM: 'Moved none of 10' spoken as done)
+      const alreadyThere = !!(r && (!r.ok || refused) && RX_ALREADY.test(rawRes) && /^(rescheduleJob|voidJob)$/.test(d.act.action));
+      const ok = (!!(r && r.ok) && !refused) || alreadyThere;
+      let said = ok ? spokenDates(rawRes || 'Done.').slice(0, 240) : (refused ? spokenDates(rawRes).slice(0, 300) : ('That did not go through: ' + spokenDates(rawRes || 'no answer from the office').slice(0, 160)));
       if (alreadyThere) { const mm = /Their next job is ([^()]+?)\s*(?:\(|\u2014|,|$)/.exec(rawRes); const who = String((d.act.data && (d.act.data.client || d.act.data.name || d.act.data.clientName)) || 'That job'); said = who + ' is already on ' + spokenDates(mm ? mm[1].trim() : 'the new day') + '. Done.'; }
       if (/ownerOverride/i.test(rawRes)) s.overrideAsked = true;   // v1.38 the office asked; his next yes is the override, for the rest of the call
       const nm0 = String((d.act.data && (d.act.data.client || d.act.data.name || d.act.data.clientName || (d.act.action === 'moveDay' ? ('day ' + String(d.act.data.fromDate || d.act.data.from || d.act.data.date || '')) : ''))) || '');
-      s.ownerActs.push({ action: d.act.action, name: nm0, target: String((d.act.data && (d.act.data.newDate || d.act.data.date)) || '').slice(0, 10), ok, said: said.slice(0, 200) });
+      s.ownerActs.push({ action: d.act.action, name: nm0, target: String((d.act.data && (d.act.data.newDate || d.act.data.date)) || '').slice(0, 10) + (d.act.action === 'setPrice' ? '|$' + String((d.act.data && d.act.data.price) || '') : (d.act.action === 'updateWorkOrderStatus' ? '|' + String((d.act.data && d.act.data.status) || '') : '')), ok, said: said.slice(0, 200), override: !!(d.act.data && d.act.data.ownerOverride) });
       if (ok && d.act.data && d.act.data.ownerOverride) s.ownerOverride = true;
       // v1.29: on a buffered turn her own words come first with any 'done' claim cut out, then the office's verdict
       if (ledIn) sendText(s.ws, said, true);   // v1.40 she already said 'On it'; now just the result
