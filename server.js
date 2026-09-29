@@ -62,7 +62,7 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 
 // ---- config (all via environment; render.yaml wires these) -----------------
-const GW_VERSION = '1.47';
+const GW_VERSION = '1.48';
 const PORT       = process.env.PORT || 10000;
 const ANTHROPIC  = process.env.ANTHROPIC_API_KEY || '';
 const GAS_URL    = (process.env.GAS_EXEC_URL || '').replace(/\/+$/, ''); // full /exec URL, no query
@@ -110,12 +110,32 @@ async function fetchPack(phone, timeoutMs, mid) {
     throw new Error('bad pack: ' + JSON.stringify(j).slice(0, 120));
   } finally { clearTimeout(tm); }
 }
+// v1.48 THE BRAIN THAT IS ALWAYS THERE (Sept 28 6:31 PM: the office was busy with a 3-minute editor run, the generic pack never
+// arrived, and the first caller heard 'Let me get you straight to the team'; Sept 28 7:54 PM the owner heard 'my brain did not
+// load'). Two nets under the live pack: the last good generic pack is saved to disk on every refresh and reloaded at boot (a
+// restart on the same instance keeps yesterday's brain), and under that a copy of the receptionist brain shipped with this file
+// (fallback-brain.txt) so a cold instance with a dead office still answers like Aggie. A fallback pack is marked so the log says
+// which brain took the call.
+const PACK_DISK = require('path').join(require('os').tmpdir(), 'aggie-generic-pack.json');
+function fallbackPack() {
+  try {
+    const sys = require('fs').readFileSync(require('path').join(__dirname, 'fallback-brain.txt'), 'utf8');
+    return { ok: true, v: 'fallback', sys, greeting: 'Apex Pest Solutions, this is Aggie. How can I help you today?', vm: '', model: '', at: new Date().toISOString(), fallback: true, ownerLines: [] };
+  } catch (e) { logErr('pack.fallback', e); return null; }
+}
 async function refreshGeneric() {
   try {
     genericPack = await fetchPack('', 25000);
     genericAt = Date.now();
     logInfo('brainpack refreshed (v' + genericPack.v + ', ' + genericPack.sys.length + ' chars)');
-  } catch (e) { logErr('brainpack.refresh', e); }
+    try { require('fs').writeFileSync(PACK_DISK, JSON.stringify(genericPack)); } catch (e2) { logErr('brainpack.disk', e2); }
+  } catch (e) {
+    logErr('brainpack.refresh', e);
+    if (!genericPack) {
+      try { const j = JSON.parse(require('fs').readFileSync(PACK_DISK, 'utf8')); if (j && j.sys) { genericPack = j; genericPack.stale = true; logErr('brainpack.disk', 'using the pack saved ' + Math.round((Date.now() - Date.parse(j.at || 0)) / 60000) + ' min ago'); } } catch (e3) {}
+      if (!genericPack) { genericPack = fallbackPack(); if (genericPack) logErr('brainpack.fallback', 'no office pack at all - the built-in receptionist brain is answering'); }
+    }
+  }
 }
 refreshGeneric();
 setInterval(refreshGeneric, 4 * 60 * 1000);
@@ -812,11 +832,12 @@ async function runTurn(s, voicePrompt, seq) {
     for (let i = 0; i < 16 && !genericPack && !s.callerPack; i++) {
       await new Promise(res => setTimeout(res, 500));
     }
-    pack = s.callerPack || genericPack;
+    pack = s.callerPack || genericPack || fallbackPack();   // v1.48 the built-in brain before any transfer
     if (!pack) {
       sendText(s.ws, 'Let me get you straight to the team.', true);
       return doTransfer(s, 'no brain after patience window');
     }
+    if (pack.fallback) logErr('pack.fallback', 'call ' + s.callSid + ' is running on the built-in brain');
   }
   const ownerLaw = (s.callerPack && s.callerPack.owner === true)
     ? '\nOWNER BATCH LAW (v1.42): "move everything on <day> to <day>" is ONE act: moveDay {fromDate, newDate, window?, ownerOverride?}; "send confirmations to the rest / to the unconfirmed" is ONE act: sendConfirmations {date, names?, skip?}; "mark X confirmed" is updateWorkOrderStatus {client, date?, status:"Confirmed"} - you CAN change a status; "terminate service / close the account" is terminateService {client}. Reply "On it." and emit the act in the SAME turn; never do a batch one item at a time, never ask which jobs or whether to start, never say a thing must be done in the app when one of these acts does it. When he says yes to any batch, that yes covers every item - no per-item asking, no re-announcing a finished item, one short line per result. If the office reports nothing on a day he can see jobs on, your schedule is stale: say so and look it up (searchJobs) before contradicting him. "Will you / can you send confirmations to the unconfirmed?" is the order itself - run it, do not ask "want me to?" first.\n'
@@ -834,7 +855,7 @@ async function runTurn(s, voicePrompt, seq) {
   const isOwnerLine = !!(s.callerPack && s.callerPack.owner === true);
   const sinceHeard = Date.now() - Number((s.ws && s.ws._turnT0) || Date.now());   // the pack wait on a first turn already spent some of the caller's patience
   const lastHeard = String(voicePrompt || '').trim();
-  const goodbye = lastHeard.split(/\s+/).length <= 6 && /\b(bye|goodbye|see you|take care)\b/i.test(lastHeard);   // v1.45 no 'One sec.' before a goodbye · v1.46 only a real goodbye - 'Okay.' before a booking left 9 s of dead air (sim run 6)
+  const goodbye = lastHeard.split(/\s+/).length <= 12 && /\b(bye|goodbye|see you|take care)\b/i.test(lastHeard);   // v1.48 'Great, thank you so much Aggie, I appreciate it. Bye!' is nine words   // v1.45 no 'One sec.' before a goodbye · v1.46 only a real goodbye - 'Okay.' before a booking left 9 s of dead air (sim run 6)
   const filler = (!s.mid && !goodbye) ? setTimeout(() => { try { sendText(s.ws, isOwnerLine ? 'One second.' : (s.convo.length <= 1 ? 'Sure — let me take a look.' : 'One sec.'), true); } catch (e) {} }, Math.max(1200, 5000 - sinceHeard)) : null;   // v1.46 the owner line too (8 s of silence after the move order, sim run 6)   // 5 s from when the caller stopped talking: a normal cached turn answers in 2-4 s
   try {
     try {
