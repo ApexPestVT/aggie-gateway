@@ -62,7 +62,7 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 
 // ---- config (all via environment; render.yaml wires these) -----------------
-const GW_VERSION = '1.45';
+const GW_VERSION = '1.47';
 const PORT       = process.env.PORT || 10000;
 const ANTHROPIC  = process.env.ANTHROPIC_API_KEY || '';
 const GAS_URL    = (process.env.GAS_EXEC_URL || '').replace(/\/+$/, ''); // full /exec URL, no query
@@ -94,6 +94,7 @@ function logInfo(msg) { console.log(new Date().toISOString() + ' ' + msg); }
 // caller-specific pack (dossier included) is raced at ring time with a hard
 // timeout — if GAS is slow, the generic brain answers and the call NEVER waits.
 let genericPack = null;          // { sys, greeting, vm, model, v, at }
+let lastOwnerPack = null;        // v1.46 { pack, at } - the last owner pack that landed, good for 45 min when a fresh one is slow
 let genericAt   = 0;
 
 async function fetchPack(phone, timeoutMs, mid) {
@@ -340,6 +341,7 @@ const ONESHOT_ACTS = /^(createWorkOrder|createLead|sendInvoice|chargeCard|tierSi
 async function postVoiceActOnce(s, act, ms) {
   const u = GAS_URL + '?hook=voiceact&k=' + encodeURIComponent(WKEY);
   const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), ms);
+  if (LONG_ACTS[String(act && act.action)]) s.actCtl = ctl;   // v1.46 the owner's 'stop' can cut the wait (not the office - it keeps working)
   const t0 = Date.now(); let tH = 0;
   try {
     const r = await fetch(u, { method: 'POST', headers: { 'content-type': 'application/json', 'connection': 'close' },
@@ -351,15 +353,24 @@ async function postVoiceActOnce(s, act, ms) {
   } catch (e) {
     logErr('voiceact.phase', String(act && act.action) + ' died at ' + (Date.now() - t0) + ' ms (' + (tH ? 'after headers' : 'NO HEADERS - the request never came back') + '): ' + String((e && e.message) || e));
     throw e;
-  } finally { clearTimeout(tm); }
+  } finally { clearTimeout(tm); if (s.actCtl === ctl) s.actCtl = null; }
 }
 async function postVoiceAct(s, act) {
   const an0 = String((act && act.action) || '');
   if (LONG_ACTS[an0]) {
     const hb = [];   // v1.40 a word every 30 s so the line is never dead while the office works through the day
     if (s.ws && !s.glass) { hb.push(setTimeout(() => { try { sendText(s.ws, 'Still working through them.', true); } catch (e) {} }, 30000)); hb.push(setTimeout(() => { try { sendText(s.ws, 'Almost there.', true); } catch (e) {} }, 60000)); }
+    // v1.46 NO SECOND RUN OF A DAY-LONG ACT (owner call Sept 28 8:07 PM: the afternoon moveDay wrote Cage Martin and Janet Coon, then
+    // nothing; at 90 s the gateway fired it AGAIN while the office was still on the first one, then a third time with the override - two
+    // more executions fighting the first for the script lock, 'the office did not answer' three times, and his 'No. Stop.' queued behind
+    // the whole thing. A long act runs once. If the office is still working at 90 s, she says so and tells him how to check; his
+    // 'stop' cuts the wait at once.)
     try { return await postVoiceActOnce(s, act, 90000); }
-    catch (e) { logErr('voiceact.slow', String((e && e.message) || e) + ' on ' + an0 + ' - one more try'); if (s.ws && !s.glass) { try { sendText(s.ws, 'Still moving them. Hang on.', true); } catch (e2) {} } return await postVoiceActOnce(s, act, 60000); }
+    catch (e) {
+      if (s.stopSaid) { s.stopSaid = false; throw new Error('STOPPED AT HIS WORD - the office may still be working on it; look the day up before touching it again'); }
+      logErr('voiceact.slow', String((e && e.message) || e) + ' on ' + an0 + ' - not re-run');
+      throw new Error('STILL RUNNING - the office had not answered at 90 s and this act is never run twice; some jobs may have moved. Look the day up (searchJobs) before doing anything else with it');
+    }
     finally { hb.forEach(clearTimeout); }
   }
   try { return await postVoiceActOnce(s, act, 20000); }
@@ -500,7 +511,7 @@ function stripClaims(reply) {
 // v1.31 (kit 673 parity): a callback promise carries no clock; a window job never gets a clock time in her mouth
 const RX_CALLBACK = /\b(?:(?:chris|he|someone|we|i)(?:'|’)?(?:ll| will) (?:call|ring|get back to|reach out to|text|follow up with|be in touch with) you(?: back)?|(?:have|ask|get) chris (?:call|ring|get back to|reach out to|text|follow up with) you(?: back)?)\b/i;
 const RX_CALLBACK_TIME = /\s*(?:,\s*)?\b(within (?:the |an? )?(?:hour|half hour|\d+ ?(?:minutes|mins|hours|hrs))|in (?:a few|a couple(?: of)?|\d+) ?(?:minutes|mins|hours|hrs)|by (?:noon|midday|\d{1,2}(?::\d{2})?\s*(?:am|pm|o(?:'|’)?clock)?|end of (?:the )?day|eod|tonight|this (?:morning|afternoon|evening)|close of business)|(?:first thing )?(?:tomorrow|today|tonight)(?: morning| afternoon| evening)?|right away|in a (?:bit|moment|minute)|momentarily|asap|as soon as possible|before (?:noon|\d{1,2}(?::\d{2})?\s*(?:am|pm)?|end of day|tonight|he leaves))\b/i;
-const RX_CLOCK = /\b(?:at|around|about|by|before|after)\s+(\d{1,2})(?::(\d{2}))?(?:\s*(am|pm|a\.m\.|p\.m\.|o(?:'|’)?clock))?\b(?!\s*(?:-|to|–)\s*\d)/i;
+const RX_CLOCK = /\b(?:at|around|about|by|before|after)\s+(\d{1,2})(?::(\d{2}))?(?:\s*(am|pm|a\.m\.|p\.m\.|o(?:'|’)?clock))?\b(?!\s*(?:-|to|–)\s*\d)(?!\s+[A-Z][a-z])(?!\s+(?:street|st|road|rd|drive|dr|lane|ln|ave|avenue|way|court|ct|circle|terrace|place|highway|hwy|route|rte)\b)/i;   // v1.46 'at 19 Oswald Street' is an address, not a clock (sim run 6: 'between 12 and 5 Oswald Street')
 function tidyPromises(reply, win) {
   let out = String(reply || '');
   out = out.split(/(?<=[.!?])\s+/).map(sent => {
@@ -523,7 +534,7 @@ function stripTransferLine(reply) { return String(reply || '').replace(RX_TRANSF
 // v1.35 THE HAND-OFF RULE ON THE PHONE (owner, Sept 25: 'I do not want to talk to a client unless strictly necessary'). A customer
 // sentence that hands them to Chris is removed unless the call is commercial or the sentence is about money; a scheduling hand-off
 // becomes the booking question. Missions and the owner line are untouched.
-const RX_HANDOFF = /\b(?:chris|he)(?:'|’)?(?:ll| will) (?:call|ring|get back to|reach out(?: to)?|follow up(?: with)?|confirm|text|send|be in touch|get in touch|contact|take care of|go over|look at|walk you through)\b|\bi(?:'|’)?(?:ll| will) have chris\b|\bhave chris (?:call|confirm|reach|get back|follow|text|send|look|contact)\b|\b(?:let me |i(?:'|’)?(?:ll| will) )?(?:pass|send|flag)(?:ing)? (?:this|that|it|along)[^.!?]{0,40}?\b(?:to|for) chris\b|\bmake sure chris knows\b|\bnoted? for chris to\b|\bfor chris to (?:call|text|reach|confirm|sort)\b|\bget chris for you\b/i;   // v1.45 + 'flag this for Chris to sort out', 'pass along your request for Chris to call you', 'make sure Chris knows', 'noted for Chris to call' (sim, Sept 28)
+const RX_HANDOFF = /\b(?:chris|he)(?:'|’)?(?:ll| will) (?:call|ring|get back to|reach out(?: to)?|follow up(?: with)?|confirm|text|send|be in touch|get in touch|contact|take care of|go over|look at|walk you through)\b|\bi(?:'|’)?(?:ll| will) have chris\b|\bhave chris (?:call|confirm|reach|get back|follow|text|send|look|contact)\b|\b(?:let me |i(?:'|’)?(?:ll| will) )?(?:pass|send|flag)(?:ing)? (?:this|that|it|along)[^.!?]{0,40}?\b(?:to|for) chris\b|\bmake sure chris knows\b|\bnoted? for chris to\b|\bfor chris to (?:call|text|reach|confirm|sort)\b|\bget chris for you\b|\bflag (?:this|that|it)[^.!?]{0,30}\b(?:for|to) the (?:owner|boss)\b|\bthe (?:owner|boss) (?:will|can|(?:'|’)ll) (?:call|reach|look|sort|locate|find|get back)\b/i;   // v1.47 'the owner' is Chris too (sim run 9: 'I'll flag this for the owner right now so he can locate Scott's account')   // v1.45 + 'flag this for Chris to sort out', 'pass along your request for Chris to call you', 'make sure Chris knows', 'noted for Chris to call' (sim, Sept 28)
 const RX_HANDOFF_OK = /\b(refund|charged twice|double.?charg|overcharg|bill(?:ing|ed|s)?\b|invoice|commercial|business|restaurant|property manag|building|termite|\bbats?\b|contract|estimate|dispute|credit)/i;   // v1.45 'pricing', 'quote', 'card', 'payment' dropped: she quotes the Canon and sends the card link herself (sim: 'flag this for Chris ... so you get the right pricing' rode out on the word pricing)
 const ASK_DAY = 'Just so I lock it in right — which day works best for you, morning or afternoon?';
 function stripHandoff(reply, haveDay) {
@@ -556,7 +567,8 @@ function clockLine() {
   return 'RIGHT NOW: ' + now.toLocaleDateString('en-US', { timeZone: TZ, weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' }) + ', '
     + now.toLocaleTimeString('en-US', { timeZone: TZ, hour: 'numeric', minute: '2-digit' }) + ' Eastern. Yesterday was ' + dayName(y) + ' ' + mdy(y)
     + '. Tomorrow is ' + dayName(t) + ' ' + mdy(t) + '. Then ' + tail.join(', ') + '. A weekday name with no date means the nearest one: '
-    + '"Saturday" today means ' + (dayName(y) === 'Saturday' ? 'yesterday, ' + mdy(y) : 'the coming one') + '. Never guess a weekday from a date; read it here.';
+    + '"Saturday" today means ' + (dayName(y) === 'Saturday' ? 'yesterday, ' + mdy(y) : 'the coming one') + '. Never guess a weekday from a date; read it here. '
+    + 'Before you SAY a weekday with a date, or put a date in an act, find that weekday in this line and copy its date - "this Wednesday" is the Wednesday listed here, nothing else.';   // v1.46 (Sept 28 8:07 PM: 'Wednesday, October 1st' - Wednesday was the 30th; the list was right, she did not read it)
 }
 // v1.38 SPOKEN, NOT PRINTED: the office answers in record form ('2026-09-27 12:00 PM to 5:00 PM (ownerOverride:true if you mean it.)') and
 // the voice read it as 'twenty twenty-six zero nine twenty-seven'. Dates become 'Sunday the 27th', windows become '12 to 5', the override
@@ -597,7 +609,8 @@ function newSession(ws) {
     ctl: null,                 // AbortController of the in-flight AI turn
     actsRan: [],               // v1.17: what her hands did on this call (rides to GAS in the results)
     ownerActs: [], ownerOverride: false,   // v1.38 owner-line ledger + his standing 'I mean it' for this call
-    turnSeq: 0, chain: Promise.resolve()   // v1.45 one turn at a time per call (see handlePrompt)
+    turnSeq: 0, chain: Promise.resolve(),   // v1.45 one turn at a time per call (see handlePrompt)
+    actCtl: null, stopSaid: false   // v1.46 the day-long act in the office, and the owner's 'stop' against it
   };
 }
 
@@ -702,6 +715,11 @@ async function maybeGlassPhoto(s, text) {
 async function handlePrompt(s, voicePrompt) {
   // a new utterance always cancels a stale in-flight turn (barge-in via speech)
   if (s.ctl) { try { s.ctl.abort(); } catch (e) {} }
+  if (s.actCtl && /\b(stop|hold on|hang on|wait|cancel|never mind|hold up|listen)\b/i.test(String(voicePrompt || ''))) {   // v1.46 'No. Stop.' during a day-long act: the wait ends now, she answers now
+    s.stopSaid = true; try { s.actCtl.abort(); } catch (e) {} s.actCtl = null;
+    try { sendText(s.ws, 'Stopping. I\'m listening.', true); } catch (e) {}
+    logInfo('owner said stop during a long act on ' + s.callSid);
+  }
   s.convo.push({ role: 'user', content: String(voicePrompt).slice(0, 500) });
   maxListen(s, voicePrompt);   // v1.16 shadow ears - logs only unless MAX_LIVE=1
   const seq = ++s.turnSeq;
@@ -765,6 +783,10 @@ async function runTurn(s, voicePrompt, seq) {
         sendText(s.ws, 'One second, pulling everything up.', true);   // owner line: he always has an account
         try { await Promise.race([ s.packPromise, new Promise(res => setTimeout(res, 14000)) ]); } catch (e) {}
       }
+      if (!s.callerPack && lastOwnerPack && (Date.now() - lastOwnerPack.at) < 45 * 60000) {   // v1.46 (Sept 28 7:54 PM: 'my assistant brain did not load - hang up and call me back' - the office took >16 s to build it; the one from minutes earlier was fine)
+        s.callerPack = lastOwnerPack.pack; logErr('pack.owner.stale', 'owner pack not here in 16 s for ' + s.callSid + ' - using the one from ' + Math.round((Date.now() - lastOwnerPack.at) / 60000) + ' min ago');
+        sendText(s.ws, 'Got you. Go ahead.', true);
+      }
       if (!s.callerPack) {
         logErr('pack.owner', 'owner pack never landed for ' + s.callSid + ' — refusing to run the receptionist on the owner');
         s.endWhy = 'owner brain missing';
@@ -812,8 +834,8 @@ async function runTurn(s, voicePrompt, seq) {
   const isOwnerLine = !!(s.callerPack && s.callerPack.owner === true);
   const sinceHeard = Date.now() - Number((s.ws && s.ws._turnT0) || Date.now());   // the pack wait on a first turn already spent some of the caller's patience
   const lastHeard = String(voicePrompt || '').trim();
-  const goodbye = lastHeard.split(/\s+/).length <= 6 && /\b(bye|goodbye|thanks?|thank you|that(?:'|’)?s (?:it|all)|okay|ok)\b/i.test(lastHeard);   // v1.45 no 'One sec.' before a goodbye
-  const filler = (!isOwnerLine && !s.mid && !goodbye) ? setTimeout(() => { try { sendText(s.ws, s.convo.length <= 1 ? 'Sure — let me take a look.' : 'One sec.', true); } catch (e) {} }, Math.max(1200, 5000 - sinceHeard)) : null;   // 5 s from when the caller stopped talking: a normal cached turn answers in 2-4 s
+  const goodbye = lastHeard.split(/\s+/).length <= 6 && /\b(bye|goodbye|see you|take care)\b/i.test(lastHeard);   // v1.45 no 'One sec.' before a goodbye · v1.46 only a real goodbye - 'Okay.' before a booking left 9 s of dead air (sim run 6)
+  const filler = (!s.mid && !goodbye) ? setTimeout(() => { try { sendText(s.ws, isOwnerLine ? 'One second.' : (s.convo.length <= 1 ? 'Sure — let me take a look.' : 'One sec.'), true); } catch (e) {} }, Math.max(1200, 5000 - sinceHeard)) : null;   // v1.46 the owner line too (8 s of silence after the move order, sim run 6)   // 5 s from when the caller stopped talking: a normal cached turn answers in 2-4 s
   try {
     try {
       raw = await aiTurn(sys, s.convo, tok => { if (buffered) return; spoke = true; sendText(s.ws, tok, false); }, ctl.signal, glassImg);
@@ -948,11 +970,13 @@ async function runTurn(s, voicePrompt, seq) {
       // stood by 'waiting on the system' for three turns.)
       logErr('voiceact', e);
       const why = String((e && e.message) || e).slice(0, 120);
-      const maybe = /MAY HAVE COMPLETED/.test(why);
+      const maybe = /MAY HAVE COMPLETED|STILL RUNNING|STOPPED AT HIS WORD/.test(why);   // v1.46 a long act that outran the clock is unknown, never 'did not run'
       s.convo.push({ role: 'assistant', content: maybe
         ? '[UNKNOWN ' + d.act.action + ': the office was still working when the line timed out - it may have gone through. Do NOT run it again blind; look it up first (lookup / searchJobs / searchInbox) and tell him what you find.]'
         : '[FAILED ' + d.act.action + ': the office did not answer (' + why + '). It did NOT run as far as you know. Tell him plainly; offer to try once more.]' });
-      const line = maybe ? 'The office was still working on that when it timed out. Let me check whether it went through before I touch it again.' : 'The office did not answer on that one. Want me to try it again?';
+      const line = /STOPPED AT HIS WORD/.test(why) ? 'The office may have moved some of them already - say the day and I will read you what is on it.'
+        : (/STILL RUNNING/.test(why) ? 'The office is still working through that day. Give it a minute, then ask me what is on the new day and I will read it back.'
+        : (maybe ? 'The office was still working on that when it timed out. Let me check whether it went through before I touch it again.' : 'The office did not answer on that one. Want me to try it again?'));
       if (buffered) sendText(s.ws, gateSpeak(stripOwnerClaims(d.reply), false, line), true); else sendText(s.ws, line, true);
       spokenThisTurn = true;
     }
@@ -1362,7 +1386,7 @@ wss.on('connection', (ws, mid) => {
       // receptionist booking script. Same race, same patience, same rails.
       s.packPromise = (s.mid ? fetchPack('', 25000, s.mid) : fetchPack(s.from, 25000))
         .catch(e => { logErr('pack.caller', e); return s.mid ? null : fetchPack(s.from, 25000).catch(e2 => { logErr('pack.caller.retry', e2); return null; }); })   // v1.32 one retry - the kit caches the file per phone now, so the second ask is usually instant
-        .then(p => { if (p) { s.callerPack = p; logInfo('caller pack landed for ' + s.callSid); } return p; });
+        .then(p => { if (p) { s.callerPack = p; logInfo('caller pack landed for ' + s.callSid); if (p.owner === true) lastOwnerPack = { pack: p, at: Date.now() }; } return p; });   // v1.46 remember the owner's
       startRecording(s);   // v1.1: every live call is recorded, like v23.5 days
     }
     else if (m.type === 'prompt' && m.voicePrompt) {
