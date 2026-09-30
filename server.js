@@ -62,7 +62,7 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 
 // ---- config (all via environment; render.yaml wires these) -----------------
-const GW_VERSION = '1.48';
+const GW_VERSION = '1.49';
 const PORT       = process.env.PORT || 10000;
 const ANTHROPIC  = process.env.ANTHROPIC_API_KEY || '';
 const GAS_URL    = (process.env.GAS_EXEC_URL || '').replace(/\/+$/, ''); // full /exec URL, no query
@@ -96,6 +96,9 @@ function logInfo(msg) { console.log(new Date().toISOString() + ' ' + msg); }
 let genericPack = null;          // { sys, greeting, vm, model, v, at }
 let lastOwnerPack = null;        // v1.46 { pack, at } - the last owner pack that landed, good for 45 min when a fresh one is slow
 let genericAt   = 0;
+// v1.49 caller-file timing for /health: land = ring to file in hand; build = the office's own build time (0-ish when pre-warmed)
+const packTimes = [];
+function packStat(landMs, buildMs) { packTimes.push({ at: new Date().toISOString(), land: landMs, build: buildMs == null ? null : Number(buildMs) }); while (packTimes.length > 30) packTimes.shift(); }
 
 async function fetchPack(phone, timeoutMs, mid) {
   const ctl = new AbortController();
@@ -818,8 +821,15 @@ async function runTurn(s, voicePrompt, seq) {
       // v1.32 NO DEAD AIR (Dawna Cao, Sept 25 7:30 AM: the office took >25s to hand over her file; she heard the greeting,
       // 'one second', then silence, and hung up at 21s). The first turn waits 3s for the caller file, then runs on the
       // generic brain right away; the file is swapped in on the next turn when it lands. No second wait, no filler line.
-      try { await Promise.race([ s.packPromise, new Promise(res => setTimeout(res, first ? 3000 : 800)) ]); } catch (e) {}
-      if (!s.callerPack && first) logErr('pack.late', 'caller pack not here after 3s for ' + s.callSid + ' — first turn runs generic, file swaps in when it lands');
+      // v1.49 THE HELLO DOES NOT WAIT (sim Sept 30: all 12 calls answered their first turn at 5.0 s - 3 s waiting for the caller
+      // file that never came in time, then ~2 s of brain, and the 5 s filler 'Sure - let me take a look.' glued to the greeting).
+      // When the caller's first words are just a hello ('Hello?', 'Hi, is anyone there?'), nothing in their file changes the
+      // answer - the reply is the greeting - so the generic brain answers at once and the file swaps in for turn two. A first
+      // turn that carries a real request ('this is Patty, I need to move my visit') still waits up to 3 s for the file.
+      const bareHello = first && /^\W*(hello|hi|hey|yeah|yes|good (morning|afternoon|evening))\b[\w\s,'?!.-]{0,40}$/i.test(String(voicePrompt || '').trim()) && String(voicePrompt || '').trim().split(/\s+/).length <= 7 && !/this is|my name|calling|it'?s /i.test(String(voicePrompt || ''));
+      const packWaitMs = first ? (bareHello ? 150 : 3000) : 800;
+      try { await Promise.race([ s.packPromise, new Promise(res => setTimeout(res, packWaitMs)) ]); } catch (e) {}
+      if (!s.callerPack && first && !bareHello) logErr('pack.late', 'caller pack not here after 3s for ' + s.callSid + ' — first turn runs generic, file swaps in when it lands');
     }
   }
   if (seq !== s.turnSeq) { logInfo('turn ' + seq + ' skipped after the pack wait on ' + s.callSid + ' - a newer utterance carries it'); return; }   // v1.45
@@ -1360,6 +1370,7 @@ const server = http.createServer((req, res) => {
       brainAgeSec: genericPack ? Math.round((Date.now() - genericAt) / 1000) : null,
       brainVersion: genericPack ? genericPack.v : null,
       model: MODEL, callsHandled, liveCalls: sessions.size,
+      packs: (function () { const l = packTimes.map(x => x.land).sort((a, b) => a - b); const q = f => l.length ? l[Math.min(l.length - 1, Math.floor(l.length * f))] : null; return { n: l.length, landP50: q(0.5), landP90: q(0.9), under3s: l.filter(x => x < 3000).length, last: packTimes.slice(-6) }; })(),   // v1.49
       promptCache: lastUsage || 'no turns yet since restart',
       hands: acts.slice(-8),   // v1.17: the last voicebook round-trips — proof her hands work, or exactly why not
       turns: turns.slice(-30), turnLag: (function(){ const f = turns.map(t => t.firstMs).filter(x => x > 0); if (!f.length) return null; f.sort((a,b)=>a-b); return { n: f.length, p50: f[Math.floor(f.length/2)], p90: f[Math.floor(f.length*0.9)], max: f[f.length-1], interrupts: turns.reduce((a,t)=>a+(t.interrupts||0),0), silentTurns: turns.filter(t=>!t.tokens).length }; })(),   // v1.22: the lag she feels, in numbers
@@ -1405,9 +1416,10 @@ wss.on('connection', (ws, mid) => {
       // race the caller-specific brain (dossier inside) against the clock
       // v1.3 MISSIONS: an assignment brain, fetched by mid — never the
       // receptionist booking script. Same race, same patience, same rails.
+      s._packT0 = Date.now();   // v1.49 how long the caller file takes to land
       s.packPromise = (s.mid ? fetchPack('', 25000, s.mid) : fetchPack(s.from, 25000))
         .catch(e => { logErr('pack.caller', e); return s.mid ? null : fetchPack(s.from, 25000).catch(e2 => { logErr('pack.caller.retry', e2); return null; }); })   // v1.32 one retry - the kit caches the file per phone now, so the second ask is usually instant
-        .then(p => { if (p) { s.callerPack = p; logInfo('caller pack landed for ' + s.callSid); if (p.owner === true) lastOwnerPack = { pack: p, at: Date.now() }; } return p; });   // v1.46 remember the owner's
+        .then(p => { if (p) { s.callerPack = p; try { packStat(Date.now() - s._packT0, p.buildMs); } catch (e) {} logInfo('caller pack landed for ' + s.callSid + ' in ' + (Date.now() - s._packT0) + ' ms (office build ' + (p.buildMs != null ? p.buildMs + ' ms' : '?') + ')'); if (p.owner === true) lastOwnerPack = { pack: p, at: Date.now() }; } return p; });   // v1.46 remember the owner's
       startRecording(s);   // v1.1: every live call is recorded, like v23.5 days
     }
     else if (m.type === 'prompt' && m.voicePrompt) {
