@@ -62,7 +62,7 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 
 // ---- config (all via environment; render.yaml wires these) -----------------
-const GW_VERSION = '1.51';
+const GW_VERSION = '1.52';
 const PORT       = process.env.PORT || 10000;
 const ANTHROPIC  = process.env.ANTHROPIC_API_KEY || '';
 const GAS_URL    = (process.env.GAS_EXEC_URL || '').replace(/\/+$/, ''); // full /exec URL, no query
@@ -415,7 +415,7 @@ async function postVoiceAct(s, act) {
 // v1.23 the reads: their results come back to HER, never read to the owner raw
 const READ_ACTS = { lookup:1, searchMemory:1, searchClients:1, searchJobs:1, searchInbox:1, readThread:1, lookupClient:1, lookupJob:1,
   mindReport:1, recallMemory:1, explainMemory:1, intentions:1, leadsRecent:1, salesBacklog:1, auditLeads:1, auditWon:1, previewPurge:1, cacheReport:1, callQueue:1,
-  books:1, bankRecent:1 };   // v1.50 (owner call Sept 30 4:23 PM: 'pulling the P and L... that one didn't come back') - the books come back to HER, like every read
+  books:1, bankRecent:1, searchCalls:1 };   // v1.52 the call recordings come back to her like every read (kit 742)   // v1.50 (owner call Sept 30 4:23 PM: 'pulling the P and L... that one didn't come back') - the books come back to HER, like every read
 const CUSTOMER_ACTS = { bookJob: 1, cancelJob: 1, noteJob: 1, confirmJob: 1, rescheduleJob: 1, cardLink: 1, updateContact: 1, sendQuote: 1, tierSignup: 1, dncAdd: 1 };   // v1.31: + dncAdd   // v1.30: + tierSignup (she signs them up)   // v1.18: + reschedule · v1.29: + cardLink (tier sign-up -> Square link on the call)
 // v1.36 no more 'Chris will confirm' (owner: no hand-offs). If the office is slow she says she is saving it; the promise net + office retry finish the job.
 const FALLBACK_SAY = 'One moment while I check on that.';
