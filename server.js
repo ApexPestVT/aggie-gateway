@@ -62,7 +62,7 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 
 // ---- config (all via environment; render.yaml wires these) -----------------
-const GW_VERSION = '1.49';
+const GW_VERSION = '1.51';
 const PORT       = process.env.PORT || 10000;
 const ANTHROPIC  = process.env.ANTHROPIC_API_KEY || '';
 const GAS_URL    = (process.env.GAS_EXEC_URL || '').replace(/\/+$/, ''); // full /exec URL, no query
@@ -414,7 +414,8 @@ async function postVoiceAct(s, act) {
 // fallback is spoken and the post-call sweep + the red row catch the rest.
 // v1.23 the reads: their results come back to HER, never read to the owner raw
 const READ_ACTS = { lookup:1, searchMemory:1, searchClients:1, searchJobs:1, searchInbox:1, readThread:1, lookupClient:1, lookupJob:1,
-  mindReport:1, recallMemory:1, explainMemory:1, intentions:1, leadsRecent:1, salesBacklog:1, auditLeads:1, auditWon:1, previewPurge:1, cacheReport:1, callQueue:1 };
+  mindReport:1, recallMemory:1, explainMemory:1, intentions:1, leadsRecent:1, salesBacklog:1, auditLeads:1, auditWon:1, previewPurge:1, cacheReport:1, callQueue:1,
+  books:1, bankRecent:1 };   // v1.50 (owner call Sept 30 4:23 PM: 'pulling the P and L... that one didn't come back') - the books come back to HER, like every read
 const CUSTOMER_ACTS = { bookJob: 1, cancelJob: 1, noteJob: 1, confirmJob: 1, rescheduleJob: 1, cardLink: 1, updateContact: 1, sendQuote: 1, tierSignup: 1, dncAdd: 1 };   // v1.31: + dncAdd   // v1.30: + tierSignup (she signs them up)   // v1.18: + reschedule · v1.29: + cardLink (tier sign-up -> Square link on the call)
 // v1.36 no more 'Chris will confirm' (owner: no hand-offs). If the office is slow she says she is saving it; the promise net + office retry finish the job.
 const FALLBACK_SAY = 'One moment while I check on that.';
@@ -651,7 +652,25 @@ function mergeLead(into, from) {
 // (caller talked over her). /health shows the last 30. First-token > 2000ms is the lag she feels; a turn with 0 tokens
 // is a silent turn; a call full of interrupts is a caller hearing her late.
 const turns = [];
+// v1.50 NO ACT WORDS IN HER MOUTH (owner call Sept 30: she said 'Flash action. Search memory data. Q Charlie Thomas.' - an act written
+// into the spoken reply and read aloud). Anything that looks like an act - a JSON object, a key:value pair naming an action, a code fence -
+// is cut from what the voice speaks. Her words stay; the plumbing never reaches the caller's ear.
+function speakable(t) {
+  let x = String(t == null ? '' : t);
+  if (!/[{}`"]|action|\bq\s*:/i.test(x)) return x;
+  x = x.replace(/```[\s\S]*?(```|$)/g, ' ')
+       .replace(/\{[^{}]*("action"|"data"|"q"\s*:)[^{}]*\}+/gi, ' ')
+       .replace(/"?\baction"?\s*:\s*"?[a-z]+[A-Z]?\w*"?,?/g, ' ')
+       .replace(/"?\bdata"?\s*:\s*\{?/g, ' ')
+       .replace(/"q"\s*:\s*"[^"]*"/g, ' ')
+       .replace(/"?\baction"?\s*:/g, ' ')
+       .replace(/"[a-z]+[A-Z]\w*"\s*,?/g, ' ')
+       .replace(/[{}]/g, ' ')
+       .replace(/\s{2,}/g, ' ');
+  return x;
+}
 function sendText(ws, token, last) {
+  try { token = speakable(token); } catch (eSp) {}
   try {
     if (ws && ws._turnT0) { const now = Date.now(); if (!ws._turnFirst) ws._turnFirst = now - ws._turnT0; ws._turnTokens = (ws._turnTokens || 0) + 1;
       if (last) { turns.push({ at: new Date().toISOString(), call: ws._callSid || '', firstMs: ws._turnFirst, doneMs: now - ws._turnT0, tokens: ws._turnTokens, interrupts: ws._turnInterrupts || 0, words: String(token || '').split(/\s+/).length }); if (turns.length > 30) turns.shift(); ws._turnT0 = 0; ws._turnFirst = 0; ws._turnTokens = 0; ws._turnInterrupts = 0; } }
@@ -984,6 +1003,11 @@ async function runTurn(s, voicePrompt, seq) {
       const alreadyThere = !!(r && (!r.ok || refused) && RX_ALREADY.test(rawRes) && /^(rescheduleJob|voidJob)$/.test(d.act.action));
       const ok = (!!(r && r.ok) && !refused) || alreadyThere;
       let said = ok ? spokenDates(rawRes || 'Done.').slice(0, 240) : (refused ? spokenDates(rawRes).slice(0, 300) : ('That did not go through: ' + spokenDates(rawRes || 'no answer from the office').slice(0, 160)));
+      // v1.51 AN ERROR PAGE IS NOT A 'NO' (owner call Oct 1 8:12 AM: two moveDay retries came back as a Google HTML page and she said
+      // 'That did not go through. Unreadable.' - while three of the six jobs HAD moved at 8:11). An HTML answer means the office's reply
+      // was lost, not that nothing ran: she says so in plain words and the conversation note says UNKNOWN, look it up first.
+      const pageBack = !ok && /^unreadable/i.test(String((r && r.error) || ''));
+      if (pageBack) said = 'The office sent back an error page instead of an answer, so I can\'t tell you yet whether that went through. Ask me what\'s on the day and I\'ll read it to you before I touch it again.';
       if (alreadyThere) { const mm = /Their next job is ([^()]+?)\s*(?:\(|\u2014|,|$)/.exec(rawRes); const who = String((d.act.data && (d.act.data.client || d.act.data.name || d.act.data.clientName)) || 'That job'); said = who + ' is already on ' + spokenDates(mm ? mm[1].trim() : 'the new day') + '. Done.'; }
       if (/ownerOverride/i.test(rawRes)) s.overrideAsked = true;   // v1.38 the office asked; his next yes is the override, for the rest of the call
       const nm0 = String((d.act.data && (d.act.data.client || d.act.data.name || d.act.data.clientName || (/^(moveDay|sendConfirmations)$/.test(d.act.action) ? ('day ' + String(d.act.data.fromDate || d.act.data.from || d.act.data.date || 'today')) : ''))) || '');   // v1.45
@@ -993,7 +1017,7 @@ async function runTurn(s, voicePrompt, seq) {
       if (ledIn) sendText(s.ws, said, true);   // v1.40 she already said 'On it'; now just the result
       else if (buffered) { const lead = ok ? stripClaims(d.reply) : stripOwnerClaims(stripClaims(d.reply)); sendText(s.ws, (lead ? (lead + ' ') : '') + said, true); spokenThisTurn = true; }   // v1.33 no 'Done' over a refusal
       else sendText(s.ws, said, true);
-      s.convo.push({ role: 'assistant', content: '[' + (ok ? 'ran ' : 'FAILED ') + d.act.action + ': ' + rawRes.slice(0, 200) + (alreadyThere ? ' (that is the move we made earlier this call - done, move on)' : '') + ']' });
+      s.convo.push({ role: 'assistant', content: '[' + (ok ? 'ran ' : (pageBack ? 'UNKNOWN (error page back - it may have run; look the day or job up before running it again) ' : 'FAILED ')) + d.act.action + ': ' + (pageBack ? 'no readable answer' : rawRes.slice(0, 200)) + (alreadyThere ? ' (that is the move we made earlier this call - done, move on)' : '') + ']' });
       logInfo('voiceact ' + d.act.action + ' ' + (ok ? 'ok' : 'FAIL') + ' for ' + nm0 + ' on ' + s.callSid + ': ' + rawRes.slice(0, 120));
     } catch (e) {
       // v1.38 the failure is spoken ONCE, with her own 'doing it now' words cut, and written into the conversation so she knows.
@@ -1434,7 +1458,19 @@ wss.on('connection', (ws, mid) => {
       logErr('relay.error', m.description || JSON.stringify(m).slice(0, 200));
     }
   });
-  ws.on('close', () => { sessions.delete(ws); finalize(s); });
+  ws.on('close', (code, reason) => {
+    sessions.delete(ws);
+    // v1.50 THE OWNER NEVER RINGS HIMSELF (owner call Sept 30 4:23-4:38 PM: fifteen minutes in, the relay session ended, Twilio moved on to
+    // the next verb in the answer script - 'One moment while I try Chris for you' + a Dial to Chris's cell - and he got his own voicemail).
+    // Every close is logged with its code so we learn WHY a session ends; an owner call that closes without being finished is hung up by
+    // REST at once, so the fall-through Dial never rings his phone.
+    try {
+      const own = !!(s.callerPack && s.callerPack.owner === true);
+      if (!s.done) logErr('relay.closed', 'session closed code ' + code + (reason && String(reason) ? (' "' + String(reason).slice(0, 120) + '"') : '') + ' on ' + (s.callSid || '?') + (own ? ' (OWNER line)' : '') + ' after ' + Math.round((Date.now() - (s.startedAt || Date.now())) / 1000) + ' s');
+      if (own && !s.done && s.callSid) twilioUpdateCall(s.callSid, '<Response><Say>Chris, the line dropped on my side. Call me right back.</Say><Hangup/></Response>').catch(e => logErr('owner.closeHangup', e));
+    } catch (eC) { logErr('ws.close', eC); }
+    finalize(s);
+  });
   ws.on('error', e => { logErr('ws', e); });
 });
 
